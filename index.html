@@ -1,0 +1,2808 @@
+<!doctype html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>FreshMart - Grocery Store with MongoDB Backend</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+
+    <script>
+        tailwind.config = {
+            theme: {
+                extend: {
+                    colors: {
+                        primary: {
+                            50: '#f0fdf4',
+                            100: '#dcfce7',
+                            200: '#bbf7d0',
+                            300: '#86efac',
+                            400: '#4ade80',
+                            500: '#22c55e',
+                            600: '#16a34a',
+                            700: '#15803d',
+                            800: '#166534',
+                            900: '#14532d',
+                        },
+                        secondary: {
+                            400: '#fbbf24',
+                            500: '#f59e0b',
+                            600: '#d97706',
+                        }
+                    }
+                }
+            }
+        }
+
+        function renderPayPalButtons(orderData, placeBtn, originalText) {
+            const container = document.getElementById('paypal-button-container');
+            if (!window.paypal) {
+                showToast('PayPal SDK not loaded. Try again later.');
+                if (placeBtn) {
+                    placeBtn.disabled = false;
+                    placeBtn.textContent = originalText || 'Place Order';
+                }
+                return;
+            }
+
+            // Clear previous buttons
+            container.innerHTML = '';
+
+            paypal.Buttons({
+                style: { color: 'blue', shape: 'pill', label: 'pay' },
+                createOrder: function (data, actions) {
+                    return actions.order.create({
+                        purchase_units: [{
+                            amount: { value: orderData.total.toFixed(2) }
+                        }]
+                    });
+                },
+                onApprove: function (data, actions) {
+                    return actions.order.capture().then(async function (details) {
+                        // Build paymentResult to send to backend
+                        const paymentResult = {
+                            id: details.id,
+                            status: details.status,
+                            update_time: details.update_time,
+                            email_address: details.payer && details.payer.email_address
+                        };
+
+                        // Attach payment info and create order on backend
+                        orderData.paymentMethod = 'paypal';
+                        orderData.paymentResult = paymentResult;
+
+                        const result = await createOrder(orderData);
+                        if (result && result.success) {
+                            if (placeBtn) placeBtn.textContent = 'Order Placed ✓';
+                            showToast('Payment successful and order placed! 🎉');
+                            cart = [];
+                            updateCart();
+                            if (typeof closeDeliveryModal === 'function') closeDeliveryModal();
+                            if (typeof toggleCart === 'function') toggleCart();
+                            setTimeout(() => navigateTo('track'), 1200);
+                        } else {
+                            showToast('Order creation failed after payment. Contact support.');
+                            if (placeBtn) {
+                                placeBtn.disabled = false;
+                                placeBtn.textContent = originalText || 'Place Order';
+                            }
+                        }
+                    });
+                },
+                onError: function (err) {
+                    console.error('PayPal Buttons error:', err);
+                    showToast('PayPal payment failed or was cancelled.');
+                    if (placeBtn) {
+                        placeBtn.disabled = false;
+                        placeBtn.textContent = originalText || 'Place Order';
+                    }
+                }
+            }).render('#paypal-button-container');
+        }
+    </script>
+    <style>
+        body {
+            box-sizing: border-box;
+        }
+
+        .fade-in {
+            animation: fadeIn 0.5s ease-in;
+        }
+
+        @keyframes fadeIn {
+            from {
+                opacity: 0;
+                transform: translateY(20px);
+            }
+
+            to {
+                opacity: 1;
+                transform: translateY(0);
+            }
+        }
+
+        .slide-in-right {
+            animation: slideInRight 0.3s ease-out;
+        }
+
+        @keyframes slideInRight {
+            from {
+                transform: translateX(100%);
+            }
+
+            to {
+                transform: translateX(0);
+            }
+        }
+
+        .modal-backdrop {
+            background: rgba(0, 0, 0, 0.5);
+            backdrop-filter: blur(4px);
+        }
+
+        .delivery-pulse {
+            animation: deliveryPulse 2s infinite;
+        }
+
+        @keyframes deliveryPulse {
+
+            0%,
+            100% {
+                transform: scale(1);
+            }
+
+            50% {
+                transform: scale(1.1);
+            }
+        }
+
+        .spinner {
+            border: 3px solid #f3f3f3;
+            border-top: 3px solid #16a34a;
+            border-radius: 50%;
+            width: 40px;
+            height: 40px;
+            animation: spin 1s linear infinite;
+        }
+
+        @keyframes spin {
+            0% {
+                transform: rotate(0deg);
+            }
+
+            100% {
+                transform: rotate(360deg);
+            }
+        }
+    </style>
+    <style>
+        @view-transition {
+            navigation: auto;
+        }
+    </style>
+    <script src="/_sdk/data_sdk.js" type="text/javascript"
+        onerror="console.warn('data_sdk.js not found or failed to load')" async></script>
+    <script src="/_sdk/element_sdk.js" type="text/javascript"
+        onerror="console.warn('element_sdk.js not found or failed to load')" async></script>
+    <!-- PayPal SDK (client-side only). Do NOT put secret keys in frontend. -->
+    <script
+        src="https://www.paypal.com/sdk/js?client-id=AVTXEhyd66K3uSDs6-i9-dqfZYiDcceYwFbaFeyTDchqeuRkoY2dbxvwJiNocB1tNoNzFUt3yqKAxyvj&currency=USD"
+        async></script>
+    <!-- Socket.IO client (for realtime order updates) -->
+    <script src="https://cdn.socket.io/4.7.2/socket.io.min.js"></script>
+</head>
+
+<body class="bg-gray-50"><!-- Loading Overlay -->
+    <script>
+        // Ensure global functions exist so inline onclick handlers don't throw
+        window.closeDeliveryModal = window.closeDeliveryModal || function () {
+            const modal = document.getElementById('delivery-modal');
+            if (modal) modal.remove();
+        };
+
+        window.toggleCart = window.toggleCart || function () {
+            const cartSidebar = document.getElementById('cart-sidebar');
+            if (cartSidebar) cartSidebar.classList.toggle('hidden');
+        };
+    </script>
+    <div id="loading-overlay" class="fixed inset-0 bg-white z-50 flex items-center justify-center">
+        <div class="text-center">
+            <div class="spinner mx-auto mb-4"></div>
+            <p class="text-gray-600 font-semibold">Loading FreshMart...</p>
+        </div>
+    </div><!-- Header -->
+    <header class="bg-white shadow-md sticky top-0 z-50">
+        <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+            <div class="flex justify-between items-center h-16"><!-- Logo -->
+                <div class="flex items-center space-x-2 cursor-pointer" onclick="navigateTo('home')">
+                    <div
+                        class="w-10 h-10 bg-gradient-to-br from-primary-500 to-primary-600 rounded-lg flex items-center justify-center">
+                        <span class="text-white font-bold text-xl">🛒</span>
+                    </div><span class="text-2xl font-bold text-primary-600">FreshMart</span>
+                </div><!-- Navigation -->
+                <nav class="hidden md:flex space-x-8" id="main-nav"><a href="#" onclick="navigateTo('home')"
+                        class="text-gray-700 hover:text-primary-600 font-medium transition">Home</a> <a href="#"
+                        onclick="navigateTo('products')"
+                        class="text-gray-700 hover:text-primary-600 font-medium transition">Products</a> <a href="#"
+                        onclick="navigateTo('orders')"
+                        class="text-gray-700 hover:text-primary-600 font-medium transition">My Orders</a> <a href="#"
+                        onclick="navigateTo('track')"
+                        class="text-gray-700 hover:text-primary-600 font-medium transition">Track Delivery</a>
+                </nav><!-- Right Menu -->
+                <div class="flex items-center space-x-6"><button onclick="toggleCart()" class="relative">
+                        <svg class="w-6 h-6 text-gray-700 hover:text-primary-600 transition" fill="none"
+                            stroke="currentColor" viewbox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                                d="M3 3h2l.4 2M7 13h10l4-8H5.4M7 13L5.4 5M7 13l-2.293 2.293c-.63.63-.184 1.707.707 1.707H17m0 0a2 2 0 100 4 2 2 0 000-4zm-8 2a2 2 0 11-4 0 2 2 0 014 0z">
+                            </path>
+                        </svg><span id="cart-count"
+                            class="absolute -top-2 -right-2 bg-secondary-500 text-white text-xs rounded-full w-5 h-5 flex items-center justify-center hidden">0</span>
+                    </button>
+                    <div id="user-menu" class="hidden relative"><button onclick="toggleUserDropdown()"
+                            class="flex items-center space-x-2 text-gray-700 hover:text-primary-600">
+                            <svg class="w-6 h-6" fill="none" stroke="currentColor" viewbox="0 0 24 24">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                                    d="M16 7a4 4 0 11-8 0 4 4 0 018 0zM12 14a7 7 0 00-7 7h14a7 7 0 00-7-7z"></path>
+                            </svg><span id="user-name" class="font-medium"></span> </button>
+                        <div id="user-dropdown"
+                            class="absolute right-0 mt-2 w-48 bg-white rounded-lg shadow-lg py-2 hidden"><a href="#"
+                                onclick="navigateTo('orders')"
+                                class="block px-4 py-2 text-gray-700 hover:bg-gray-100">My Orders</a> <a href="#"
+                                onclick="navigateTo('track')"
+                                class="block px-4 py-2 text-gray-700 hover:bg-gray-100">Track Delivery</a> <a href="#"
+                                onclick="navigateTo('admin')" id="admin-link"
+                                class="block px-4 py-2 text-gray-700 hover:bg-gray-100 hidden">Admin Dashboard</a> <a
+                                href="#" onclick="logout()"
+                                class="block px-4 py-2 text-red-600 hover:bg-gray-100">Logout</a>
+                        </div>
+                    </div><button id="login-btn" onclick="showLoginModal()"
+                        class="text-gray-700 hover:text-primary-600">
+                        <svg class="w-6 h-6" fill="none" stroke="currentColor" viewbox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                                d="M16 7a4 4 0 11-8 0 4 4 0 018 0zM12 14a7 7 0 00-7 7h14a7 7 0 00-7-7z"></path>
+                        </svg></button>
+                </div>
+            </div>
+        </div>
+    </header><!-- Main Content Area -->
+    <main id="app-content"><!-- Content will be dynamically loaded here -->
+    </main><!-- Login Modal -->
+    <div id="login-modal" class="fixed inset-0 z-50 hidden modal-backdrop flex items-center justify-center p-4">
+        <div class="bg-white rounded-2xl shadow-2xl w-full max-w-md fade-in" onclick="event.stopPropagation()">
+            <div class="p-8">
+                <div class="text-center mb-8">
+                    <div
+                        class="w-16 h-16 bg-gradient-to-br from-primary-500 to-primary-600 rounded-full flex items-center justify-center mx-auto mb-4">
+                        <span class="text-white font-bold text-2xl">🛒</span>
+                    </div>
+                    <h2 class="text-3xl font-bold text-gray-900">Welcome Back</h2>
+                    <p class="text-gray-600 mt-2">Sign in to your account</p>
+                </div>
+                <form id="login-form" onsubmit="handleLogin(event)">
+                    <div class="space-y-4">
+                        <div><label for="login-email" class="block text-sm font-medium text-gray-700 mb-2">Email
+                                Address</label> <input type="email" id="login-email" required
+                                class="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-primary-500 focus:border-transparent"
+                                placeholder="you@example.com">
+                        </div>
+                        <div><label for="login-password"
+                                class="block text-sm font-medium text-gray-700 mb-2">Password</label> <input
+                                type="password" id="login-password" required
+                                class="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-primary-500 focus:border-transparent"
+                                placeholder="••••••••">
+                        </div>
+                        <div class="flex items-center justify-between"><label class="flex items-center"> <input
+                                    type="checkbox" class="rounded text-primary-600 focus:ring-primary-500"> <span
+                                    class="ml-2 text-sm text-gray-600">Remember me</span> </label> <a href="#"
+                                class="text-sm text-primary-600 hover:text-primary-700">Forgot password?</a>
+                        </div><button type="submit" id="login-submit-btn"
+                            class="w-full bg-primary-600 text-white py-3 rounded-lg font-semibold hover:bg-primary-700 transition">
+                            Sign In </button>
+                    </div>
+                </form>
+                <div class="mt-6 text-center">
+                    <p class="text-gray-600">Don't have an account? <a href="#" onclick="showRegisterModal()"
+                            class="text-primary-600 hover:text-primary-700 font-semibold">Sign up</a></p>
+                </div><button onclick="hideLoginModal()"
+                    class="absolute top-4 right-4 text-gray-400 hover:text-gray-600">
+                    <svg class="w-6 h-6" fill="none" stroke="currentColor" viewbox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12">
+                        </path>
+                    </svg></button>
+            </div>
+        </div>
+    </div><!-- Register Modal -->
+    <div id="register-modal" class="fixed inset-0 z-50 hidden modal-backdrop flex items-center justify-center p-4">
+        <div class="bg-white rounded-2xl shadow-2xl w-full max-w-md fade-in" onclick="event.stopPropagation()">
+            <div class="p-8">
+                <div class="text-center mb-8">
+                    <div
+                        class="w-16 h-16 bg-gradient-to-br from-primary-500 to-primary-600 rounded-full flex items-center justify-center mx-auto mb-4">
+                        <span class="text-white font-bold text-2xl">🛒</span>
+                    </div>
+                    <h2 class="text-3xl font-bold text-gray-900">Create Account</h2>
+                    <p class="text-gray-600 mt-2">Join FreshMart today</p>
+                </div>
+                <form id="register-form" onsubmit="handleRegister(event)">
+                    <div class="space-y-4">
+                        <div><label for="register-name" class="block text-sm font-medium text-gray-700 mb-2">Full
+                                Name</label> <input type="text" id="register-name" required
+                                class="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-primary-500 focus:border-transparent"
+                                placeholder="John Doe">
+                        </div>
+                        <div><label for="register-email" class="block text-sm font-medium text-gray-700 mb-2">Email
+                                Address</label> <input type="email" id="register-email" required
+                                class="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-primary-500 focus:border-transparent"
+                                placeholder="you@example.com">
+                        </div>
+                        <div><label for="register-password"
+                                class="block text-sm font-medium text-gray-700 mb-2">Password</label> <input
+                                type="password" id="register-password" required minlength="6"
+                                class="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-primary-500 focus:border-transparent"
+                                placeholder="••••••••">
+                        </div>
+                        <div><label for="register-confirm-password"
+                                class="block text-sm font-medium text-gray-700 mb-2">Confirm Password</label> <input
+                                type="password" id="register-confirm-password" required minlength="6"
+                                class="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-primary-500 focus:border-transparent"
+                                placeholder="••••••••">
+                        </div><button type="submit" id="register-submit-btn"
+                            class="w-full bg-primary-600 text-white py-3 rounded-lg font-semibold hover:bg-primary-700 transition">
+                            Create Account </button>
+                    </div>
+                </form>
+                <div class="mt-6 text-center">
+                    <p class="text-gray-600">Already have an account? <a href="#" onclick="showLoginModal()"
+                            class="text-primary-600 hover:text-primary-700 font-semibold">Sign in</a></p>
+                </div><button onclick="hideRegisterModal()"
+                    class="absolute top-4 right-4 text-gray-400 hover:text-gray-600">
+                    <svg class="w-6 h-6" fill="none" stroke="currentColor" viewbox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12">
+                        </path>
+                    </svg></button>
+            </div>
+        </div>
+    </div><!-- Shopping Cart Sidebar -->
+    <div id="cart-sidebar" class="fixed top-0 right-0 w-full h-full bg-black bg-opacity-50 z-50 hidden"
+        onclick="toggleCart()">
+        <div class="absolute right-0 w-full max-w-md h-full bg-white shadow-2xl slide-in-right"
+            onclick="event.stopPropagation()">
+            <div class="flex flex-col h-full">
+                <div class="flex justify-between items-center p-6 border-b">
+                    <h2 class="text-2xl font-bold text-gray-900">Shopping Cart</h2><button onclick="toggleCart()"
+                        class="text-gray-500 hover:text-gray-700">
+                        <svg class="w-6 h-6" fill="none" stroke="currentColor" viewbox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                                d="M6 18L18 6M6 6l12 12"></path>
+                        </svg></button>
+                </div>
+                <div id="cart-items" class="flex-1 overflow-y-auto p-6">
+                    <div class="text-center text-gray-500 py-12">
+                        <div class="text-6xl mb-4">
+                            🛒
+                        </div>
+                        <p>Your cart is empty</p>
+                    </div>
+                </div>
+                <div id="cart-footer" class="border-t p-6 hidden">
+                    <div class="space-y-3 mb-6">
+                        <div class="flex justify-between text-gray-600"><span>Subtotal</span> <span
+                                id="cart-subtotal">$0.00</span>
+                        </div>
+                        <div class="flex justify-between text-gray-600"><span>Delivery</span> <span
+                                class="text-primary-600">FREE</span>
+                        </div>
+                        <div class="flex justify-between text-xl font-bold text-gray-900 pt-3 border-t">
+                            <span>Total</span> <span id="cart-total">$0.00</span>
+                        </div>
+                    </div><button onclick="checkout()"
+                        class="w-full bg-primary-600 text-white py-4 rounded-lg font-semibold hover:bg-primary-700 transition">
+                        Proceed to Checkout </button>
+                </div>
+            </div>
+        </div>
+    </div><!-- Toast Notification -->
+    <div id="toast" class="fixed bottom-6 right-6 bg-gray-900 text-white px-6 py-3 rounded-lg shadow-lg hidden z-50">
+        <p id="toast-message"></p>
+    </div>
+    <script>
+        // ==================== API CONFIGURATION ====================
+        const API_BASE_URL = 'http://localhost:3000/api';
+
+        // ==================== REAL-TIME (Socket.IO) ====================
+        let socket = null;
+        function initSocket() {
+            try {
+                // connect to backend socket server (adjust URL if backend runs elsewhere)
+                socket = io('http://localhost:3000');
+
+                socket.on('connect', () => console.log('Socket connected:', socket.id));
+
+                socket.on('orderUpdated', (updatedOrder) => {
+                    console.log('Realtime order update received:', updatedOrder);
+                    // Brief notification and refresh relevant UI
+                    showToast(`Order ${updatedOrder.orderNumber} status: ${updatedOrder.status}`);
+                    if (currentPage === 'track') loadTrackDeliveryPage();
+                    if (currentPage === 'orders') loadOrdersPage();
+                });
+            } catch (e) {
+                console.warn('Socket init failed', e);
+            }
+        }
+
+        // Initialize socket immediately so we can join room after auth
+        initSocket();
+
+        // ==================== STATE MANAGEMENT ====================
+        let currentUser = null;
+        let authToken = null;
+        let cart = [];
+        let currentPage = 'home';
+        let products = [];
+        let orders = [];
+        let users = [];
+
+        // ==================== API HELPER FUNCTIONS ====================
+
+        async function apiRequest(endpoint, options = {}) {
+            const defaultHeaders = {
+                'Content-Type': 'application/json',
+            };
+
+            if (authToken) {
+                defaultHeaders['Authorization'] = `Bearer ${authToken}`;
+            }
+
+            const config = {
+                ...options,
+                headers: {
+                    ...defaultHeaders,
+                    ...options.headers,
+                },
+            };
+
+            try {
+                const response = await fetch(`${API_BASE_URL}${endpoint}`, config);
+                const data = await response.json();
+
+                if (!response.ok) {
+                    throw new Error(data.message || 'API request failed');
+                }
+
+                return { success: true, data };
+            } catch (error) {
+                console.error('API Error:', error);
+                return { success: false, error: error.message };
+            }
+        }
+
+
+        // ==================== AUTHENTICATION ====================
+
+        async function handleLogin(event) {
+            event.preventDefault();
+
+            const btn = document.getElementById('login-submit-btn');
+            btn.disabled = true;
+            btn.textContent = 'Signing in...';
+
+            const email = document.getElementById('login-email').value;
+            const password = document.getElementById('login-password').value;
+
+            const result = await apiRequest('/auth/login', {
+                method: 'POST',
+                body: JSON.stringify({ email, password })
+            });
+
+            if (result.success) {
+                authToken = result.data.token;
+                currentUser = result.data.user;
+
+                localStorage.setItem('authToken', authToken);
+                localStorage.setItem('currentUser', JSON.stringify(currentUser));
+
+                updateUIForLoggedInUser();
+                hideLoginModal();
+                // Join user's socket room for realtime updates
+                try { if (socket && currentUser && currentUser._id) socket.emit('join', currentUser._id); } catch (e) { }
+                showToast(`Welcome back, ${currentUser.name}!`);
+
+                if (currentUser.role === 'admin') {
+                    navigateTo('admin');
+                } else if (currentUser.role === 'delivery') {
+                    // Delivery users go to delivery dashboard
+                    navigateTo('delivery');
+                } else {
+                    navigateTo('home');
+                }
+            } else {
+                showToast(result.error || 'Invalid email or password');
+            }
+
+            btn.disabled = false;
+            btn.textContent = 'Sign In';
+        }
+
+        async function handleRegister(event) {
+            event.preventDefault();
+
+            const btn = document.getElementById('register-submit-btn');
+            btn.disabled = true;
+            btn.textContent = 'Creating account...';
+
+            const name = document.getElementById('register-name').value;
+            const email = document.getElementById('register-email').value;
+            const password = document.getElementById('register-password').value;
+            const confirmPassword = document.getElementById('register-confirm-password').value;
+
+            if (password !== confirmPassword) {
+                showToast('Passwords do not match');
+                btn.disabled = false;
+                btn.textContent = 'Create Account';
+                return;
+            }
+
+            const result = await apiRequest('/auth/register', {
+                method: 'POST',
+                body: JSON.stringify({ name, email, password })
+            });
+
+            if (result.success) {
+                authToken = result.data.token;
+                currentUser = result.data.user;
+
+                localStorage.setItem('authToken', authToken);
+                localStorage.setItem('currentUser', JSON.stringify(currentUser));
+
+                updateUIForLoggedInUser();
+                hideRegisterModal();
+                // Join user's socket room for realtime updates
+                try { if (socket && currentUser && currentUser._id) socket.emit('join', currentUser._id); } catch (e) { }
+                showToast(`Account created successfully! Welcome, ${name}!`);
+                if (currentUser.role === 'delivery') {
+                    navigateTo('delivery');
+                } else {
+                    navigateTo('home');
+                }
+            } else {
+                showToast(result.error || 'Failed to create account');
+            }
+
+            btn.disabled = false;
+            btn.textContent = 'Create Account';
+        }
+
+        function logout() {
+            currentUser = null;
+            authToken = null;
+            localStorage.removeItem('authToken');
+            localStorage.removeItem('currentUser');
+            cart = [];
+            updateUIForLoggedOutUser();
+            navigateTo('home');
+            showToast('Logged out successfully');
+        }
+
+        function checkAuth() {
+            try {
+                const savedToken = localStorage.getItem('authToken');
+                const savedUser = localStorage.getItem('currentUser');
+
+                if (savedToken && savedUser && savedUser !== 'undefined' && savedUser !== 'null') {
+                    authToken = savedToken;
+                    currentUser = JSON.parse(savedUser);
+                    updateUIForLoggedInUser();
+                    // Join user's socket room so they receive real-time updates
+                    try { if (socket && currentUser && currentUser._id) socket.emit('join', currentUser._id); } catch (e) { }
+                }
+            } catch (error) {
+                console.error('Error checking auth:', error);
+                // Clear invalid data
+                localStorage.removeItem('authToken');
+                localStorage.removeItem('currentUser');
+            }
+        }
+
+        function updateUIForLoggedInUser() {
+            document.getElementById('login-btn').classList.add('hidden');
+            document.getElementById('user-menu').classList.remove('hidden');
+            document.getElementById('user-name').textContent = currentUser.name;
+
+            if (currentUser.role === 'admin') {
+                document.getElementById('admin-link').classList.remove('hidden');
+            }
+        }
+
+        function updateUIForLoggedOutUser() {
+            document.getElementById('login-btn').classList.remove('hidden');
+            document.getElementById('user-menu').classList.add('hidden');
+            document.getElementById('admin-link').classList.add('hidden');
+        }
+
+        function toggleUserDropdown() {
+            const dropdown = document.getElementById('user-dropdown');
+            dropdown.classList.toggle('hidden');
+        }
+
+        // ==================== PRODUCTS API ====================
+
+        async function fetchProducts() {
+            const result = await apiRequest('/products');
+            if (result.success) {
+                products = result.data;
+                return products;
+            }
+            return [];
+        }
+
+        async function createProduct(productData) {
+            return await apiRequest('/products', {
+                method: 'POST',
+                body: JSON.stringify(productData)
+            });
+        }
+
+        async function updateProduct(productId, productData) {
+            return await apiRequest(`/products/${productId}`, {
+                method: 'PUT',
+                body: JSON.stringify(productData)
+            });
+        }
+
+        async function deleteProduct(productId) {
+            return await apiRequest(`/products/${productId}`, {
+                method: 'DELETE'
+            });
+        }
+
+        // ==================== ORDERS API ====================
+
+        async function fetchOrders() {
+            const result = await apiRequest('/orders');
+            if (result.success) {
+                orders = result.data;
+                return orders;
+            }
+            return [];
+        }
+
+        async function fetchMyOrders() {
+            const result = await apiRequest('/orders/my-orders');
+            if (result.success) {
+                return result.data;
+            }
+            return [];
+        }
+
+        async function createOrder(orderData) {
+            return await apiRequest('/orders', {
+                method: 'POST',
+                body: JSON.stringify(orderData)
+            });
+        }
+
+        async function updateOrderStatus(orderId, status) {
+            return await apiRequest(`/orders/${orderId}/status`, {
+                method: 'PUT',
+                body: JSON.stringify({ status })
+            });
+        }
+
+        // ==================== USERS API ====================
+
+        async function fetchUsers() {
+            const result = await apiRequest('/users');
+            if (result.success) {
+                users = result.data;
+                return users;
+            }
+            return [];
+        }
+
+        // ==================== NAVIGATION ====================
+
+        async function navigateTo(page) {
+            currentPage = page;
+            const content = document.getElementById('app-content');
+
+            switch (page) {
+                case 'home':
+                    await loadHomePage();
+                    break;
+                case 'products':
+                    await loadProductsPage();
+                    break;
+                case 'orders':
+                    if (!currentUser) {
+                        showLoginModal();
+                        return;
+                    }
+                    await loadOrdersPage();
+                    break;
+                case 'track':
+                    if (!currentUser) {
+                        showLoginModal();
+                        return;
+                    }
+                    await loadTrackDeliveryPage();
+                    break;
+                case 'admin':
+                    if (!currentUser || currentUser.role !== 'admin') {
+                        showToast('Access denied. Admin only.');
+                        navigateTo('home');
+                        return;
+                    }
+                    await loadAdminDashboard();
+                    break; // This line was added to maintain the flow
+                case 'delivery':
+                    if (!currentUser || currentUser.role !== 'delivery') {
+                        showToast('Access denied. Delivery users only.');
+                        navigateTo('home');
+                        return;
+                    }
+                    await loadDeliveryDashboard();
+                    break;
+            }
+        }
+
+        window.scrollTo({ top: 0, behavior: 'smooth' });
+
+
+        async function loadHomePage() {
+            await fetchProducts();
+            const featuredProducts = products.filter(p => p.featured).slice(0, 6);
+
+            document.getElementById('app-content').innerHTML = `
+                <!-- Hero Section -->
+                <section class="bg-gradient-to-br from-primary-50 to-primary-100 py-20">
+                    <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+                        <div class="grid md:grid-cols-2 gap-12 items-center">
+                            <div class="fade-in">
+                                <h1 class="text-5xl font-bold text-gray-900 mb-6">
+                                    Fresh Groceries <span class="text-primary-600">Delivered</span> to Your Door
+                                </h1>
+                                <p class="text-xl text-gray-600 mb-8">
+                                    Shop from our wide selection of fresh produce, pantry staples, and household essentials. 
+                                    Get free delivery on orders over $50!
+                                </p>
+                                <div class="flex space-x-4">
+                                    <button onclick="navigateTo('products')" class="bg-primary-600 text-white px-8 py-3 rounded-lg font-semibold hover:bg-primary-700 transition">
+                                        Shop Now
+                                    </button>
+                                    <button onclick="navigateTo('track')" class="bg-white text-primary-600 px-8 py-3 rounded-lg font-semibold border-2 border-primary-600 hover:bg-primary-50 transition">
+                                        Track Delivery 📍
+                                    </button>
+                                </div>
+                                <div class="mt-6 bg-blue-100 border border-blue-300 rounded-lg p-4">
+                                    <p class="text-blue-800 font-semibold">🗄️ Connected to MongoDB Database!</p>
+                                    <p class="text-blue-700 text-sm mt-1">All data is securely stored and synced</p>
+                                </div>
+                            </div>
+
+                            <div class="relative fade-in">
+                                <div class="relative w-full h-96 bg-gradient-to-br from-primary-200 to-secondary-200 rounded-3xl overflow-hidden shadow-2xl">
+                                    <div class="absolute inset-0 flex items-center justify-center text-8xl">
+                                        🥗🍎🥕
+                                    </div>
+                                </div>
+                                <div class="absolute -bottom-6 -right-6 bg-white p-6 rounded-2xl shadow-xl">
+                                    <div class="text-3xl font-bold text-primary-600">50%</div>
+                                    <div class="text-sm text-gray-600">OFF Today</div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </section>
+
+                <!-- Features Section -->
+                <section class="py-16 bg-white">
+                    <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+                        <div class="grid grid-cols-1 md:grid-cols-3 gap-8">
+                            <div class="text-center">
+                                <div class="w-16 h-16 bg-primary-100 rounded-full flex items-center justify-center mx-auto mb-4 text-3xl">
+                                    🚚
+                                </div>
+                                <h3 class="text-xl font-bold text-gray-900 mb-2">Free Delivery</h3>
+                                <p class="text-gray-600">On all orders over $50</p>
+                            </div>
+                            <div class="text-center">
+                                <div class="w-16 h-16 bg-primary-100 rounded-full flex items-center justify-center mx-auto mb-4 text-3xl">
+                                    📍
+                                </div>
+                                <h3 class="text-xl font-bold text-gray-900 mb-2">Live Tracking</h3>
+                                <p class="text-gray-600">Track your delivery in real-time</p>
+                            </div>
+                            <div class="text-center">
+                                <div class="w-16 h-16 bg-primary-100 rounded-full flex items-center justify-center mx-auto mb-4 text-3xl">
+                                    ⚡
+                                </div>
+                                <h3 class="text-xl font-bold text-gray-900 mb-2">Quick Service</h3>
+                                <p class="text-gray-600">45 minutes or less</p>
+                            </div>
+                        </div>
+                    </div>
+                </section>
+
+                <!-- Featured Categories -->
+                <section class="py-16 bg-gray-50">
+                    <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+                        <div class="text-center mb-12">
+                            <h2 class="text-4xl font-bold text-gray-900 mb-4">Shop by Category</h2>
+                            <p class="text-gray-600">Browse through our carefully curated categories</p>
+                        </div>
+
+                        <div class="grid grid-cols-2 md:grid-cols-4 gap-6">
+                            <div class="bg-gradient-to-br from-green-50 to-green-100 p-8 rounded-2xl text-center hover:shadow-lg transition cursor-pointer" onclick="navigateTo('products')">
+                                <div class="text-6xl mb-4">🍎</div>
+                                <h3 class="font-bold text-gray-900 mb-2">Fresh Fruits</h3>
+                                <p class="text-sm text-gray-600">${products.filter(p => p.category === 'fruits').length} items</p>
+                            </div>
+
+                            <div class="bg-gradient-to-br from-orange-50 to-orange-100 p-8 rounded-2xl text-center hover:shadow-lg transition cursor-pointer" onclick="navigateTo('products')">
+                                <div class="text-6xl mb-4">🥕</div>
+                                <h3 class="font-bold text-gray-900 mb-2">Vegetables</h3>
+                                <p class="text-sm text-gray-600">${products.filter(p => p.category === 'vegetables').length} items</p>
+                            </div>
+
+                            <div class="bg-gradient-to-br from-yellow-50 to-yellow-100 p-8 rounded-2xl text-center hover:shadow-lg transition cursor-pointer" onclick="navigateTo('products')">
+                                <div class="text-6xl mb-4">🥛</div>
+                                <h3 class="font-bold text-gray-900 mb-2">Dairy</h3>
+                                <p class="text-sm text-gray-600">${products.filter(p => p.category === 'dairy').length} items</p>
+                            </div>
+
+                            <div class="bg-gradient-to-br from-red-50 to-red-100 p-8 rounded-2xl text-center hover:shadow-lg transition cursor-pointer" onclick="navigateTo('products')">
+                                <div class="text-6xl mb-4">🍞</div>
+                                <h3 class="font-bold text-gray-900 mb-2">Bakery</h3>
+                                <p class="text-sm text-gray-600">${products.filter(p => p.category === 'bakery').length} items</p>
+                            </div>
+                        </div>
+                    </div>
+                </section>
+
+                <!-- Featured Products -->
+                <section class="py-16 bg-white">
+                    <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+                        <div class="text-center mb-12">
+                            <h2 class="text-4xl font-bold text-gray-900 mb-4">Featured Products</h2>
+                            <p class="text-gray-600">Handpicked fresh items just for you</p>
+                        </div>
+
+                        <div class="grid grid-cols-1 md:grid-cols-3 gap-6">
+                            ${featuredProducts.map(product => `
+                                <div class="bg-white rounded-xl shadow-md overflow-hidden hover:shadow-xl transition-all hover:-translate-y-1">
+                                    <div class="relative h-48 bg-gradient-to-br from-gray-100 to-gray-200 flex items-center justify-center">
+                                        <span class="text-6xl">${product.emoji}</span>
+                                        ${product.comparePrice ? `
+                                            <div class="absolute top-2 right-2 bg-secondary-500 text-white px-2 py-1 rounded-lg text-sm font-bold">
+                                                ${Math.round(((product.comparePrice - product.price) / product.comparePrice) * 100)}% OFF
+                                            </div>
+                                        ` : ''}
+                                    </div>
+
+                                    <div class="p-4">
+                                        <div class="text-sm text-primary-600 font-semibold mb-1 capitalize">${product.category}</div>
+                                        <h3 class="font-semibold text-gray-900 mb-2">${product.name}</h3>
+                                        <p class="text-sm text-gray-600 mb-3">${product.unit}</p>
+
+                                        <div class="flex items-center justify-between">
+                                            <div>
+                                                <div class="text-xl font-bold text-gray-900">$${product.price.toFixed(2)}</div>
+                                                ${product.comparePrice ? `
+                                                    <div class="text-sm text-gray-500 line-through">$${product.comparePrice.toFixed(2)}</div>
+                                                ` : ''}
+                                            </div>
+
+                                            <button onclick="addToCart('${product._id}')" class="bg-primary-600 text-white px-4 py-2 rounded-lg hover:bg-primary-700 transition">
+                                                Add
+                                            </button>
+                                        </div>
+                                    </div>
+                                </div>
+                            `).join('')}
+                        </div>
+
+                        <div class="text-center mt-12">
+                            <button onclick="navigateTo('products')" class="bg-primary-600 text-white px-8 py-3 rounded-lg font-semibold hover:bg-primary-700 transition">
+                                View All Products
+                            </button>
+                        </div>
+                    </div>
+                </section>
+
+                <!-- Newsletter -->
+                <section class="py-16 bg-gradient-to-br from-primary-600 to-primary-700">
+                    <div class="max-w-4xl mx-auto px-4 sm:px-6 lg:px-8 text-center">
+                        <h2 class="text-4xl font-bold text-white mb-4">Stay Updated!</h2>
+                        <p class="text-primary-100 mb-8">Subscribe to get special offers, free giveaways, and updates</p>
+                        <form onsubmit="handleNewsletter(event)" class="flex max-w-md mx-auto">
+                            <input type="email" placeholder="Enter your email" required class="flex-1 px-6 py-3 rounded-l-lg focus:outline-none" />
+                            <button type="submit" class="bg-secondary-500 text-white px-8 py-3 rounded-r-lg font-semibold hover:bg-secondary-600 transition">
+                                Subscribe
+                            </button>
+                        </form>
+                    </div>
+                </section>
+            `;
+        }
+
+        async function loadProductsPage() {
+            await fetchProducts();
+
+            document.getElementById('app-content').innerHTML = `
+                <section class="py-16 bg-gray-50 min-h-screen">
+                    <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+                        <div class="mb-12">
+                            <h1 class="text-4xl font-bold text-gray-900 mb-4">All Products</h1>
+                            <p class="text-gray-600">Browse our complete collection of fresh groceries (${products.length} products in database)</p>
+                        </div>
+
+                        <div class="flex space-x-2 mb-8">
+                            <button onclick="filterProducts('all')" id="filter-all" class="px-4 py-2 bg-primary-600 text-white rounded-lg font-medium">All</button>
+                            <button onclick="filterProducts('fruits')" id="filter-fruits" class="px-4 py-2 bg-white text-gray-700 rounded-lg font-medium hover:bg-gray-100">Fruits</button>
+                            <button onclick="filterProducts('vegetables')" id="filter-vegetables" class="px-4 py-2 bg-white text-gray-700 rounded-lg font-medium hover:bg-gray-100">Vegetables</button>
+                            <button onclick="filterProducts('dairy')" id="filter-dairy" class="px-4 py-2 bg-white text-gray-700 rounded-lg font-medium hover:bg-gray-100">Dairy</button>
+                        </div>
+
+                        <div id="products-grid" class="grid grid-cols-1 md:grid-cols-4 gap-6">
+                            ${products.map(product => `
+                                <div class="product-card bg-white rounded-xl shadow-md overflow-hidden hover:shadow-xl transition-all hover:-translate-y-1" data-category="${product.category}">
+                                    <div class="relative h-48 bg-gradient-to-br from-gray-100 to-gray-200 flex items-center justify-center">
+                                        <span class="text-6xl">${product.emoji}</span>
+                                        ${product.comparePrice ? `
+                                            <div class="absolute top-2 right-2 bg-secondary-500 text-white px-2 py-1 rounded-lg text-sm font-bold">
+                                                ${Math.round(((product.comparePrice - product.price) / product.comparePrice) * 100)}% OFF
+                                            </div>
+                                        ` : ''}
+                                        <div class="absolute top-2 left-2 bg-white px-2 py-1 rounded-lg text-xs font-semibold text-gray-600">
+                                            Stock: ${product.stock}
+                                        </div>
+                                    </div>
+
+                                    <div class="p-4">
+                                        <div class="text-sm text-primary-600 font-semibold mb-1 capitalize">${product.category}</div>
+                                        <h3 class="font-semibold text-gray-900 mb-2">${product.name}</h3>
+                                        <p class="text-sm text-gray-600 mb-3">${product.unit}</p>
+
+                                        <div class="flex items-center justify-between">
+                                            <div>
+                                                <div class="text-xl font-bold text-gray-900">$${product.price.toFixed(2)}</div>
+                                                ${product.comparePrice ? `
+                                                    <div class="text-sm text-gray-500 line-through">$${product.comparePrice.toFixed(2)}</div>
+                                                ` : ''}
+                                            </div>
+
+                                            <button onclick="addToCart('${product._id}')" class="bg-primary-600 text-white px-4 py-2 rounded-lg hover:bg-primary-700 transition">
+                                                Add
+                                            </button>
+                                        </div>
+                                    </div>
+                                </div>
+                            `).join('')}
+                        </div>
+                    </div>
+                </section>
+            `;
+        }
+
+        async function loadOrdersPage() {
+            const userOrders = await fetchMyOrders();
+
+            if (userOrders.length === 0) {
+                document.getElementById('app-content').innerHTML = `
+                    <section class="py-16 bg-gray-50 min-h-screen">
+                        <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+                            <h1 class="text-4xl font-bold text-gray-900 mb-8">My Orders</h1>
+                            
+                            <div class="bg-white rounded-xl shadow-md p-12 text-center">
+                                <div class="text-6xl mb-4">📦</div>
+                                <h2 class="text-2xl font-bold text-gray-900 mb-2">No orders yet</h2>
+                                <p class="text-gray-600 mb-6">Start shopping to see your orders here</p>
+                                <button onclick="navigateTo('products')" class="bg-primary-600 text-white px-8 py-3 rounded-lg font-semibold hover:bg-primary-700 transition">
+                                    Start Shopping
+                                </button>
+                            </div>
+                        </div>
+                    </section>
+                `;
+                return;
+            }
+
+            document.getElementById('app-content').innerHTML = `
+                <section class="py-16 bg-gray-50 min-h-screen">
+                    <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+                        <h1 class="text-4xl font-bold text-gray-900 mb-8">My Orders (${userOrders.length} orders)</h1>
+                        
+                        <div class="space-y-6">
+                            ${userOrders.slice().reverse().map(order => `
+                                <div class="bg-white rounded-xl shadow-md p-6">
+                                    <div class="flex justify-between items-start mb-4">
+                                        <div>
+                                            <h3 class="text-lg font-bold text-gray-900">Order #${order.orderNumber}</h3>
+                                            <p class="text-sm text-gray-600">${new Date(order.createdAt).toLocaleString()}</p>
+                                            ${order.estimatedDelivery ? `
+                                                <p class="text-sm text-primary-600 mt-1">⏱️ Estimated: ${new Date(order.estimatedDelivery).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</p>
+                                            ` : ''}
+                                        </div>
+                                        <div class="text-right">
+                                            <div class="inline-block px-3 py-1 rounded-full text-sm font-semibold ${order.status === 'delivered' ? 'bg-green-100 text-green-800' :
+                    order.status === 'out_for_delivery' ? 'bg-primary-100 text-primary-800' :
+                        order.status === 'processing' ? 'bg-blue-100 text-blue-800' :
+                            'bg-yellow-100 text-yellow-800'
+                }">
+                                                ${order.status.toUpperCase()}
+                                            </div>
+                                            <p class="text-xl font-bold text-gray-900 mt-2">$${order.total.toFixed(2)}</p>
+                                            ${order.status !== 'delivered' ? `
+                                                <button onclick="viewOrderTracking('${order.orderNumber}')" class="mt-2 text-sm text-primary-600 hover:text-primary-700 font-semibold">
+                                                    📍 Track Order
+                                                </button>
+                                            ` : ''}
+                                        </div>
+                                    </div>
+                                    
+                                    ${order.deliveryAddress ? `
+                                        <div class="bg-gray-50 rounded-lg p-4 mb-4">
+                                            <h4 class="font-semibold text-gray-900 mb-2">📍 Delivery Address</h4>
+                                            <p class="text-sm text-gray-700">${order.deliveryName}</p>
+                                            <p class="text-sm text-gray-700">${order.deliveryPhone}</p>
+                                            <p class="text-sm text-gray-700">${order.deliveryAddress}, ${order.deliveryCity} ${order.deliveryZip}</p>
+                                            ${order.deliveryNotes ? `<p class="text-sm text-gray-600 mt-2 italic">"${order.deliveryNotes}"</p>` : ''}
+                                        </div>
+                                    ` : ''}
+                                    
+                                    <div class="border-t pt-4">
+                                        <h4 class="font-semibold text-gray-900 mb-3">Items:</h4>
+                                        <div class="space-y-2">
+                                            ${order.items.map(item => `
+                                                <div class="flex justify-between text-sm">
+                                                    <span class="text-gray-700">${item.name} x ${item.quantity}</span>
+                                                    <span class="font-semibold text-gray-900">$${(item.price * item.quantity).toFixed(2)}</span>
+                                                </div>
+                                            `).join('')}
+                                        </div>
+                                    </div>
+                                </div>
+                            `).join('')}
+                        </div>
+                    </div>
+                </section>
+            `;
+        }
+
+        async function loadTrackDeliveryPage() {
+            const userOrders = await fetchMyOrders();
+            // If user has no orders at all, show empty state
+            if (!userOrders || userOrders.length === 0) {
+                document.getElementById('app-content').innerHTML = `
+                    <section class="py-16 bg-gray-50 min-h-screen">
+                        <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+                            <h1 class="text-4xl font-bold text-gray-900 mb-8">Track Delivery</h1>
+                            
+                            <div class="bg-white rounded-xl shadow-md p-12 text-center">
+                                <div class="text-6xl mb-4">📍</div>
+                                <h2 class="text-2xl font-bold text-gray-900 mb-2">No Active Deliveries</h2>
+                                <p class="text-gray-600 mb-6">You don't have any orders in transit</p>
+                                <button onclick="navigateTo('products')" class="bg-primary-600 text-white px-8 py-3 rounded-lg font-semibold hover:bg-primary-700 transition">
+                                    Start Shopping
+                                </button>
+                            </div>
+                        </div>
+                      </section>
+                `;
+                return;
+            }
+
+            // Prefer a non-delivered (active) order; if none, show the most recent order (even if delivered)
+            const activeOrder = userOrders.find(o => o.status !== 'delivered');
+            const latestOrder = activeOrder || userOrders[0];
+
+            document.getElementById('app-content').innerHTML = `
+                <section class="py-16 bg-gray-50 min-h-screen">
+                    <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+                        <h1 class="text-4xl font-bold text-gray-900 mb-8">Track Your Delivery</h1>
+                        
+                        <div class="grid grid-cols-1 lg:grid-cols-3 gap-8">
+                            <!-- Live Map -->
+                            <div class="lg:col-span-2">
+                                <div class="bg-white rounded-xl shadow-md overflow-hidden">
+                                    <div class="bg-primary-600 text-white p-4">
+                                        <h2 class="text-xl font-bold">📍 Live Location Tracking</h2>
+                                        <p class="text-sm text-primary-100">Order #${latestOrder.orderNumber}</p>
+                                    </div>
+                                    
+                                    <div class="h-96 bg-gray-100 relative">
+                                        ${latestOrder.deliveryLat && latestOrder.deliveryLng ? `
+                                            <iframe 
+                                                class="w-full h-full border-0" 
+                                                src="https://www.openstreetmap.org/export/embed.html?bbox=${latestOrder.deliveryLng - 0.02},${latestOrder.deliveryLat - 0.02},${latestOrder.deliveryLng + 0.02},${latestOrder.deliveryLat + 0.02}&layer=mapnik&marker=${latestOrder.deliveryLat},${latestOrder.deliveryLng}" 
+                                                loading="lazy">
+                                            </iframe>
+                                        ` : `
+                                            <div class="absolute inset-0 flex items-center justify-center">
+                                                <div class="text-center">
+                                                    <div class="text-6xl mb-4 delivery-pulse">🚚</div>
+                                                    <p class="text-gray-600">Location tracking available soon</p>
+                                                </div>
+                                            </div>
+                                        `}
+                                    </div>
+                                    
+                                    <div class="p-4 bg-gray-50 border-t">
+                                        <div class="flex items-center justify-between text-sm">
+                                            <span class="text-gray-600">Estimated Arrival:</span>
+                                            <span class="font-bold text-primary-600">${new Date(latestOrder.estimatedDelivery).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                            
+                            <!-- Delivery Status -->
+                            <div class="lg:col-span-1 space-y-6">
+                                <!-- Status Timeline -->
+                                <div class="bg-white rounded-xl shadow-md p-6">
+                                    <h3 class="text-lg font-bold text-gray-900 mb-6">Delivery Status</h3>
+                                    
+                                    <div class="space-y-6">
+                                        <div class="flex items-start space-x-4">
+                                            <div class="w-10 h-10 rounded-full bg-green-500 flex items-center justify-center text-white flex-shrink-0">
+                                                ✓
+                                            </div>
+                                            <div class="flex-1">
+                                                <p class="font-semibold text-gray-900">Order Confirmed</p>
+                                                <p class="text-sm text-gray-600">${new Date(latestOrder.createdAt).toLocaleTimeString()}</p>
+                                            </div>
+                                        </div>
+                                        
+                                        <div class="flex items-start space-x-4">
+                                            <div class="w-10 h-10 rounded-full ${latestOrder.status === 'processing' || latestOrder.status === 'out_for_delivery' || latestOrder.status === 'delivered' ? 'bg-green-500' : 'bg-gray-300'} flex items-center justify-center text-white flex-shrink-0">
+                                                ${latestOrder.status === 'processing' || latestOrder.status === 'out_for_delivery' || latestOrder.status === 'delivered' ? '✓' : '2'}
+                                            </div>
+                                            <div class="flex-1">
+                                                <p class="font-semibold text-gray-900">Preparing Order</p>
+                                                <p class="text-sm text-gray-600">Packing your items</p>
+                                            </div>
+                                        </div>
+                                        
+                                        <div class="flex items-start space-x-4">
+                                            <div class="w-10 h-10 rounded-full ${latestOrder.status === 'out_for_delivery' || latestOrder.status === 'delivered' ? 'bg-green-500' : latestOrder.status === 'processing' ? 'bg-primary-600 delivery-pulse' : 'bg-gray-300'} flex items-center justify-center text-white flex-shrink-0">
+                                                ${latestOrder.status === 'out_for_delivery' || latestOrder.status === 'delivered' ? '✓' : '🚚'}
+                                            </div>
+                                            <div class="flex-1">
+                                                <p class="font-semibold text-gray-900">Out for Delivery</p>
+                                                <p class="text-sm text-gray-600">Driver on the way</p>
+                                            </div>
+                                        </div>
+                                        
+                                        <div class="flex items-start space-x-4">
+                                            <div class="w-10 h-10 rounded-full ${latestOrder.status === 'delivered' ? 'bg-green-500' : 'bg-gray-300'} flex items-center justify-center text-white flex-shrink-0">
+                                                ${latestOrder.status === 'delivered' ? '✓' : '4'}
+                                            </div>
+                                            <div class="flex-1">
+                                                <p class="font-semibold text-gray-900">Delivered</p>
+                                                <p class="text-sm text-gray-600">Order completed</p>
+                                            </div>
+                                        </div>
+                                    </div>
+                                </div>
+                                
+                                <!-- Delivery Info -->
+                                <div class="bg-white rounded-xl shadow-md p-6">
+                                    <h3 class="text-lg font-bold text-gray-900 mb-4">Delivery Details</h3>
+                                    
+                                    <div class="space-y-3">
+                                        <div class="flex items-start space-x-3">
+                                            <span class="text-xl">📦</span>
+                                            <div>
+                                                <p class="text-sm text-gray-600">Order Number</p>
+                                                <p class="font-semibold text-gray-900">${latestOrder.orderNumber}</p>
+                                            </div>
+                                        </div>
+                                        
+                                        ${latestOrder.deliveryAddress ? `
+                                            <div class="flex items-start space-x-3">
+                                                <span class="text-xl">📍</span>
+                                                <div>
+                                                    <p class="text-sm text-gray-600">Delivery Address</p>
+                                                    <p class="font-semibold text-gray-900">${latestOrder.deliveryAddress}</p>
+                                                    <p class="text-sm text-gray-700">${latestOrder.deliveryCity}, ${latestOrder.deliveryZip}</p>
+                                                </div>
+                                            </div>
+                                            
+                                            <div class="flex items-start space-x-3">
+                                                <span class="text-xl">📞</span>
+                                                <div>
+                                                    <p class="text-sm text-gray-600">Contact</p>
+                                                    <p class="font-semibold text-gray-900">${latestOrder.deliveryPhone}</p>
+                                                </div>
+                                            </div>
+                                        ` : ''}
+                                        
+
+                                        <div class="flex items-start space-x-3">
+                                            <span class="text-xl">💰</span>
+                                            <div>
+                                                <p class="text-sm text-gray-600">Total Amount</p>
+                                                <p class="font-semibold text-gray-900">$${latestOrder.total.toFixed(2)}</p>
+                                            </div>
+                                        </div>
+                                    </div>
+                                </div>
+                                
+                                <!-- Call Driver Button -->
+                                <button onclick="contactDriver('${latestOrder.orderNumber}')" class="w-full bg-primary-600 text-white py-3 rounded-lg font-semibold hover:bg-primary-700 transition">
+                                    📞 Contact Driver
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+                </section>
+            `;
+
+            // Start a short polling loop to refresh the track view so users see status updates made by admin
+            try {
+                if (window.trackInterval) clearInterval(window.trackInterval);
+            } catch (e) { }
+            window.trackInterval = setInterval(() => {
+                // Only refresh if still on the track page
+                if (currentPage === 'track') loadTrackDeliveryPage();
+                else if (window.trackInterval) clearInterval(window.trackInterval);
+            }, 8000);
+        }
+
+        async function loadAdminDashboard() {
+            await fetchProducts();
+            await fetchOrders();
+            await fetchUsers();
+
+            const revenue = orders.reduce((sum, order) => sum + order.total, 0);
+
+            document.getElementById('app-content').innerHTML = `
+                <section class="py-8 bg-gray-50 min-h-screen">
+                    <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+                        <div class="mb-8">
+                            <h1 class="text-4xl font-bold text-gray-900 mb-2">Admin Dashboard</h1>
+                            <p class="text-gray-600">Manage your store, products, and orders (MongoDB Backend)</p>
+                        </div>
+
+                        <!-- Stats Cards -->
+                        <div class="grid grid-cols-1 md:grid-cols-4 gap-6 mb-8">
+                            <div class="bg-white rounded-xl shadow-md p-6">
+                                <div class="flex items-center justify-between">
+                                    <div>
+                                        <p class="text-gray-600 text-sm font-medium">Total Products</p>
+                                        <p class="text-3xl font-bold text-gray-900 mt-2">${products.length}</p>
+                                    </div>
+                                    <div class="w-12 h-12 bg-primary-100 rounded-lg flex items-center justify-center text-2xl">
+                                        🛒
+                                    </div>
+                                </div>
+                            </div>
+
+                            <div class="bg-white rounded-xl shadow-md p-6">
+                                <div class="flex items-center justify-between">
+                                    <div>
+                                        <p class="text-gray-600 text-sm font-medium">Total Orders</p>
+                                        <p class="text-3xl font-bold text-gray-900 mt-2">${orders.length}</p>
+                                    </div>
+                                    <div class="w-12 h-12 bg-blue-100 rounded-lg flex items-center justify-center text-2xl">
+                                        📦
+                                    </div>
+                                </div>
+                            </div>
+
+                            <div class="bg-white rounded-xl shadow-md p-6">
+                                <div class="flex items-center justify-between">
+                                    <div>
+                                        <p class="text-gray-600 text-sm font-medium">Total Users</p>
+                                        <p class="text-3xl font-bold text-gray-900 mt-2">${users.length}</p>
+                                    </div>
+                                    <div class="w-12 h-12 bg-purple-100 rounded-lg flex items-center justify-center text-2xl">
+                                        👥
+                                    </div>
+                                </div>
+                            </div>
+
+                            <div class="bg-white rounded-xl shadow-md p-6">
+                                <div class="flex items-center justify-between">
+                                    <div>
+                                        <p class="text-gray-600 text-sm font-medium">Total Revenue</p>
+                                        <p class="text-3xl font-bold text-gray-900 mt-2">$${revenue.toFixed(2)}</p>
+                                    </div>
+                                    <div class="w-12 h-12 bg-green-100 rounded-lg flex items-center justify-center text-2xl">
+                                        💰
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- Tabs -->
+                        <div class="bg-white rounded-xl shadow-md mb-6">
+                            <div class="border-b">
+                                <nav class="flex space-x-8 px-6" aria-label="Tabs">
+                                    <button onclick="switchAdminTab('products')" id="tab-products" class="admin-tab py-4 px-1 border-b-2 border-primary-600 font-medium text-primary-600">
+                                        Products
+                                    </button>
+                                    <button onclick="switchAdminTab('orders')" id="tab-orders" class="admin-tab py-4 px-1 border-b-2 border-transparent font-medium text-gray-500 hover:text-gray-700">
+                                        Orders
+                                    </button>
+                                    <button onclick="switchAdminTab('users')" id="tab-users" class="admin-tab py-4 px-1 border-b-2 border-transparent font-medium text-gray-500 hover:text-gray-700">
+                                        Users
+                                    </button>
+                                </nav>
+                            </div>
+
+                            <div class="p-6">
+                                <div id="admin-tab-content">
+                                    <!-- Content will be loaded here -->
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </section>
+            `;
+
+            switchAdminTab('products');
+        }
+
+        function switchAdminTab(tab) {
+            document.querySelectorAll('.admin-tab').forEach(btn => {
+                btn.classList.remove('border-primary-600', 'text-primary-600');
+                btn.classList.add('border-transparent', 'text-gray-500');
+            });
+
+            document.getElementById(`tab-${tab}`).classList.remove('border-transparent', 'text-gray-500');
+            document.getElementById(`tab-${tab}`).classList.add('border-primary-600', 'text-primary-600');
+
+            const content = document.getElementById('admin-tab-content');
+
+            switch (tab) {
+                case 'products':
+                    content.innerHTML = getAdminProductsHTML();
+                    break;
+                case 'orders':
+                    content.innerHTML = getAdminOrdersHTML();
+                    break;
+                case 'users':
+                    content.innerHTML = getAdminUsersHTML();
+                    break;
+            }
+        }
+
+        function getAdminProductsHTML() {
+            return `
+                <div>
+                    <div class="flex justify-between items-center mb-6">
+                        <h2 class="text-2xl font-bold text-gray-900">Products Management</h2>
+                        <button onclick="showAddProductForm()" class="bg-primary-600 text-white px-6 py-2 rounded-lg font-semibold hover:bg-primary-700 transition">
+                            + Add Product
+                        </button>
+                    </div>
+
+                    <div class="overflow-x-auto">
+                        <table class="min-w-full divide-y divide-gray-200">
+                            <thead class="bg-gray-50">
+                                <tr>
+                                    <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Product</th>
+                                    <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Category</th>
+                                    <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Price</th>
+                                    <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Stock</th>
+                                    <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Featured</th>
+                                    <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Actions</th>
+                                </tr>
+                            </thead>
+                            <tbody class="bg-white divide-y divide-gray-200">
+                                ${products.map(product => `
+                                    <tr>
+                                        <td class="px-6 py-4 whitespace-nowrap">
+                                            <div class="flex items-center">
+                                                <div class="text-2xl mr-3">${product.emoji}</div>
+                                                <div>
+                                                    <div class="font-medium text-gray-900">${product.name}</div>
+                                                    <div class="text-sm text-gray-500">${product.unit}</div>
+                                                </div>
+                                            </div>
+                                        </td>
+                                        <td class="px-6 py-4 whitespace-nowrap">
+                                            <span class="px-2 py-1 text-xs font-semibold rounded-full bg-primary-100 text-primary-800 capitalize">
+                                                ${product.category}
+                                            </span>
+                                        </td>
+                                        <td class="px-6 py-4 whitespace-nowrap">
+                                            <div class="text-sm font-medium text-gray-900">$${product.price.toFixed(2)}</div>
+                                            ${product.comparePrice ? `<div class="text-xs text-gray-500 line-through">$${product.comparePrice.toFixed(2)}</div>` : ''}
+                                        </td>
+                                        <td class="px-6 py-4 whitespace-nowrap">
+                                            <span class="text-sm ${product.stock > 20 ? 'text-green-600' : product.stock > 0 ? 'text-yellow-600' : 'text-red-600'}">
+                                                ${product.stock}
+                                            </span>
+                                        </td>
+                                        <td class="px-6 py-4 whitespace-nowrap">
+                                            <button onclick="toggleFeatured('${product._id}')" class="text-sm ${product.featured ? 'text-yellow-500' : 'text-gray-300'}">
+                                                ${product.featured ? '⭐' : '☆'}
+                                            </button>
+                                        </td>
+                                        <td class="px-6 py-4 whitespace-nowrap text-sm font-medium">
+                                            <button onclick="editProduct('${product._id}')" class="text-primary-600 hover:text-primary-900 mr-4">Edit</button>
+                                            <button onclick="confirmDeleteProduct('${product._id}')" class="text-red-600 hover:text-red-900">Delete</button>
+                                        </td>
+                                    </tr>
+                                `).join('')}
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            `;
+        }
+
+        function getAdminOrdersHTML() {
+            return `
+                <div>
+                    <h2 class="text-2xl font-bold text-gray-900 mb-6">Orders Management</h2>
+
+                    <div class="space-y-4">
+                        ${orders.length === 0 ? `
+                            <div class="text-center py-12 text-gray-500">
+                                <div class="text-4xl mb-4">📦</div>
+                                <p>No orders yet</p>
+                            </div>
+                        ` : orders.slice().reverse().map(order => `
+                            <div class="border border-gray-200 rounded-lg p-6">
+                                <div class="flex justify-between items-start mb-4">
+                                    <div>
+                                        <h3 class="font-bold text-lg text-gray-900">Order #${order.orderNumber}</h3>
+                                        <p class="text-sm text-gray-600">Customer: ${order.user ? order.user.name : 'Unknown'}</p>
+                                        <p class="text-sm text-gray-600">${new Date(order.createdAt).toLocaleString()}</p>
+                                        ${order.deliveryAddress ? `
+                                            <p class="text-sm text-gray-600 mt-2">📍 ${order.deliveryAddress}, ${order.deliveryCity}</p>
+                                            <p class="text-sm text-gray-600">📞 ${order.deliveryPhone}</p>
+                                        ` : ''}
+                                    </div>
+                                    <div class="text-right">
+                                        <select onchange="handleUpdateOrderStatus('${order._id}', this.value)" class="px-3 py-1 rounded-lg text-sm font-semibold border-2 ${order.status === 'delivered' ? 'border-green-500 text-green-700' :
+                    order.status === 'out_for_delivery' ? 'border-primary-600 text-primary-700' :
+                        order.status === 'processing' ? 'border-blue-500 text-blue-700' :
+                            'border-yellow-500 text-yellow-700'
+                }">
+                                            <option value="pending" ${order.status === 'pending' ? 'selected' : ''}>Pending</option>
+                                            <option value="processing" ${order.status === 'processing' ? 'selected' : ''}>Processing</option>
+                                            <option value="out_for_delivery" ${order.status === 'out_for_delivery' ? 'selected' : ''}>Out for Delivery</option>
+                                            <option value="delivered" ${order.status === 'delivered' ? 'selected' : ''}>Delivered</option>
+                                        </select>
+                                        <p class="text-xl font-bold text-gray-900 mt-2">$${order.total.toFixed(2)}</p>
+                                    </div>
+                                </div>
+                                
+                                <div class="border-t pt-4">
+                                    <h4 class="font-semibold text-gray-900 mb-2">Items:</h4>
+                                    <div class="grid grid-cols-2 gap-2">
+                                        ${order.items.map(item => `
+                                            <div class="text-sm text-gray-700">${item.name} x ${item.quantity}</div>
+                                        `).join('')}
+                                    </div>
+                                    <div class="mt-4">
+                                        <label class="text-sm font-medium text-gray-700 mr-2">Assign Delivery:</label>
+                                        <select id="assign-${order._id}" class="px-3 py-1 rounded-lg border">
+                                            <option value="">Unassigned</option>
+                                            ${users.filter(u => u.role === 'delivery').map(u => `
+                                                <option value="${u._id}" ${order.deliveryBoy && order.deliveryBoy && order.deliveryBoy._id === u._id ? 'selected' : ''}>${u.name} (${u.email})</option>
+                                            `).join('')}
+                                        </select>
+                                        <button onclick="assignDelivery('${order._id}')" class="ml-3 px-3 py-1 bg-primary-600 text-white rounded-lg text-sm">Assign</button>
+                                    </div>
+                                </div>
+                            </div>
+                        `).join('')}
+                    </div>
+                </div>
+            `;
+        }
+
+        function getAdminUsersHTML() {
+            return `
+                <div>
+                    <h2 class="text-2xl font-bold text-gray-900 mb-6">Users Management</h2>
+
+                    <div class="overflow-x-auto">
+                        <table class="min-w-full divide-y divide-gray-200">
+                            <thead class="bg-gray-50">
+                                <tr>
+                                    <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">User</th>
+                                    <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Email</th>
+                                    <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Role</th>
+                                    <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Joined</th>
+                                </tr>
+                            </thead>
+                            <tbody class="bg-white divide-y divide-gray-200">
+                                ${users.map(user => `
+                                    <tr>
+                                        <td class="px-6 py-4 whitespace-nowrap">
+                                            <div class="font-medium text-gray-900">${user.name}</div>
+                                        </td>
+                                        <td class="px-6 py-4 whitespace-nowrap">
+                                            <div class="text-sm text-gray-500">${user.email}</div>
+                                        </td>
+                                        <td class="px-6 py-4 whitespace-nowrap">
+                                            <span class="px-2 py-1 text-xs font-semibold rounded-full ${user.role === 'admin' ? 'bg-red-100 text-red-800' : 'bg-blue-100 text-blue-800'
+                }">
+                                                ${user.role.toUpperCase()}
+                                            </span>
+                                        </td>
+                                        <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
+                                            ${new Date(user.createdAt).toLocaleDateString()}
+                                        </td>
+                                    </tr>
+                                `).join('')}
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            `;
+        }
+
+        async function toggleFeatured(productId) {
+            const product = products.find(p => p._id === productId);
+            if (!product) return;
+
+            const result = await updateProduct(productId, { featured: !product.featured });
+
+            if (result.success) {
+                showToast(`${product.name} ${!product.featured ? 'marked as featured' : 'removed from featured'}`);
+                await loadAdminDashboard();
+                switchAdminTab('products');
+            } else {
+                showToast(result.error || 'Failed to update product');
+            }
+        }
+
+        function confirmDeleteProduct(productId) {
+            const confirmBtn = event.target;
+            const originalText = confirmBtn.textContent;
+
+            if (confirmBtn.textContent === 'Delete') {
+                confirmBtn.textContent = 'Confirm?';
+                confirmBtn.classList.add('bg-red-600', 'text-white', 'px-3', 'py-1', 'rounded');
+
+                setTimeout(() => {
+                    confirmBtn.textContent = originalText;
+                    confirmBtn.classList.remove('bg-red-600', 'text-white', 'px-3', 'py-1', 'rounded');
+                }, 3000);
+
+                return;
+            }
+
+            handleDeleteProduct(productId, confirmBtn, originalText);
+        }
+
+        async function handleDeleteProduct(productId, btn, originalText) {
+            btn.disabled = true;
+            btn.textContent = 'Deleting...';
+
+            const result = await deleteProduct(productId);
+
+            if (result.success) {
+                showToast('Product deleted successfully');
+                await loadAdminDashboard();
+                switchAdminTab('products');
+            } else {
+                showToast(result.error || 'Failed to delete product');
+                btn.disabled = false;
+                btn.textContent = originalText;
+            }
+        }
+
+        async function handleUpdateOrderStatus(orderId, newStatus) {
+            const result = await updateOrderStatus(orderId, newStatus);
+
+            if (result.success) {
+                showToast(`Order status updated to ${newStatus}`);
+                await loadAdminDashboard();
+                switchAdminTab('orders');
+            } else {
+                showToast(result.error || 'Failed to update order status');
+            }
+        }
+
+        async function assignDelivery(orderId) {
+            const select = document.getElementById(`assign-${orderId}`);
+            if (!select) return showToast('Assign select not found');
+            const deliveryBoyId = select.value || null;
+
+            const res = await apiRequest(`/orders/${orderId}/assign`, { method: 'PUT', body: JSON.stringify({ deliveryBoyId }) });
+            if (res.success) {
+                showToast('Assignment updated');
+                await loadAdminDashboard();
+                switchAdminTab('orders');
+            } else {
+                showToast(res.error || 'Failed to assign delivery');
+            }
+        }
+
+        function showAddProductForm() {
+            const modal = document.createElement('div');
+            modal.id = 'add-product-modal';
+            modal.className = 'fixed inset-0 z-50 modal-backdrop flex items-center justify-center p-4';
+            modal.innerHTML = `
+                <div class="bg-white rounded-2xl shadow-2xl w-full max-w-2xl fade-in" onclick="event.stopPropagation()">
+                    <div class="p-8">
+                        <div class="flex justify-between items-center mb-6">
+                            <h2 class="text-3xl font-bold text-gray-900">Add New Product</h2>
+                            <button onclick="closeAddProductModal()" class="text-gray-400 hover:text-gray-600">
+                                <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path>
+                                </svg>
+                            </button>
+                        </div>
+
+                        <form id="add-product-form" onsubmit="handleAddProduct(event)">
+                            <div class="grid grid-cols-2 gap-4">
+                                <div class="col-span-2">
+                                    <label for="product-name" class="block text-sm font-medium text-gray-700 mb-2">Product Name</label>
+                                    <input type="text" id="product-name" required class="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-primary-500 focus:border-transparent" placeholder="e.g., Fresh Oranges" />
+                                </div>
+
+                                <div>
+                                    <label for="product-category" class="block text-sm font-medium text-gray-700 mb-2">Category</label>
+                                    <select id="product-category" required class="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-primary-500 focus:border-transparent">
+                                        <option value="">Select Category</option>
+                                        <option value="fruits">Fruits</option>
+                                        <option value="vegetables">Vegetables</option>
+                                        <option value="dairy">Dairy</option>
+                                        <option value="bakery">Bakery</option>
+                                        <option value="meat">Meat & Poultry</option>
+                                        <option value="beverages">Beverages</option>
+                                    </select>
+                                </div>
+
+                                <div>
+                                    <label for="product-emoji" class="block text-sm font-medium text-gray-700 mb-2">Emoji</label>
+                                    <input type="text" id="product-emoji" required maxlength="2" class="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-primary-500 focus:border-transparent" placeholder="🍊" />
+                                </div>
+
+                                <div>
+                                    <label for="product-price" class="block text-sm font-medium text-gray-700 mb-2">Price ($)</label>
+                                    <input type="number" id="product-price" required step="0.01" min="0" class="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-primary-500 focus:border-transparent" placeholder="4.99" />
+                                </div>
+
+                                <div>
+                                    <label for="product-compare-price" class="block text-sm font-medium text-gray-700 mb-2">Compare Price ($) - Optional</label>
+                                    <input type="number" id="product-compare-price" step="0.01" min="0" class="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-primary-500 focus:border-transparent" placeholder="6.99" />
+                                </div>
+
+                                <div>
+                                    <label for="product-unit" class="block text-sm font-medium text-gray-700 mb-2">Unit</label>
+                                    <input type="text" id="product-unit" required class="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-primary-500 focus:border-transparent" placeholder="1 kg" />
+                                </div>
+
+                                <div>
+                                    <label for="product-stock" class="block text-sm font-medium text-gray-700 mb-2">Stock Quantity</label>
+                                    <input type="number" id="product-stock" required min="0" class="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-primary-500 focus:border-transparent" placeholder="50" />
+                                </div>
+
+                                <div class="col-span-2">
+                                    <label class="flex items-center space-x-2 cursor-pointer">
+                                        <input type="checkbox" id="product-featured" class="w-5 h-5 text-primary-600 border-gray-300 rounded focus:ring-primary-500" />
+                                        <span class="text-sm font-medium text-gray-700">Mark as Featured Product</span>
+                                    </label>
+                                </div>
+                            </div>
+
+                            <div class="flex space-x-4 mt-8">
+                                <button type="submit" id="add-product-btn" class="flex-1 bg-primary-600 text-white py-3 rounded-lg font-semibold hover:bg-primary-700 transition">
+                                    Add Product
+                                </button>
+                                <button type="button" onclick="closeAddProductModal()" class="flex-1 bg-gray-200 text-gray-700 py-3 rounded-lg font-semibold hover:bg-gray-300 transition">
+                                    Cancel
+                                </button>
+                            </div>
+                        </form>
+                    </div>
+                </div>
+            `;
+
+            document.body.appendChild(modal);
+            modal.addEventListener('click', function (e) {
+                if (e.target === modal) closeAddProductModal();
+            });
+        }
+
+        function closeAddProductModal() {
+            const modal = document.getElementById('add-product-modal');
+            if (modal) modal.remove();
+        }
+
+        async function handleAddProduct(event) {
+            event.preventDefault();
+
+            const btn = document.getElementById('add-product-btn');
+            btn.disabled = true;
+            btn.textContent = 'Adding...';
+
+            const productData = {
+                name: document.getElementById('product-name').value,
+                category: document.getElementById('product-category').value,
+                emoji: document.getElementById('product-emoji').value,
+                price: parseFloat(document.getElementById('product-price').value),
+                comparePrice: document.getElementById('product-compare-price').value ? parseFloat(document.getElementById('product-compare-price').value) : null,
+                unit: document.getElementById('product-unit').value,
+                stock: parseInt(document.getElementById('product-stock').value),
+                featured: document.getElementById('product-featured').checked
+            };
+
+            const result = await createProduct(productData);
+
+            if (result.success) {
+                closeAddProductModal();
+                showToast(`${productData.name} added successfully! 🎉`);
+                await loadAdminDashboard();
+                switchAdminTab('products');
+            } else {
+                showToast(result.error || 'Failed to add product');
+                btn.disabled = false;
+                btn.textContent = 'Add Product';
+            }
+        }
+
+        function editProduct(productId) {
+            const product = products.find(p => p._id === productId);
+            if (!product) return;
+
+            const modal = document.createElement('div');
+            modal.id = 'edit-product-modal';
+            modal.className = 'fixed inset-0 z-50 modal-backdrop flex items-center justify-center p-4';
+            modal.innerHTML = `
+                <div class="bg-white rounded-2xl shadow-2xl w-full max-w-2xl fade-in" onclick="event.stopPropagation()">
+                    <div class="p-8">
+                        <div class="flex justify-between items-center mb-6">
+                            <h2 class="text-3xl font-bold text-gray-900">Edit Product</h2>
+                            <button onclick="closeEditProductModal()" class="text-gray-400 hover:text-gray-600">
+                                <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path>
+                                </svg>
+                            </button>
+                        </div>
+
+                        <form id="edit-product-form" onsubmit="handleEditProduct(event, '${productId}')">
+                            <div class="grid grid-cols-2 gap-4">
+                                <div class="col-span-2">
+                                    <label for="edit-product-name" class="block text-sm font-medium text-gray-700 mb-2">Product Name</label>
+                                    <input type="text" id="edit-product-name" required value="${product.name}" class="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-primary-500 focus:border-transparent" />
+                                </div>
+
+                                <div>
+                                    <label for="edit-product-category" class="block text-sm font-medium text-gray-700 mb-2">Category</label>
+                                    <select id="edit-product-category" required class="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-primary-500 focus:border-transparent">
+                                        <option value="fruits" ${product.category === 'fruits' ? 'selected' : ''}>Fruits</option>
+                                        <option value="vegetables" ${product.category === 'vegetables' ? 'selected' : ''}>Vegetables</option>
+                                        <option value="dairy" ${product.category === 'dairy' ? 'selected' : ''}>Dairy</option>
+                                        <option value="bakery" ${product.category === 'bakery' ? 'selected' : ''}>Bakery</option>
+                                        <option value="meat" ${product.category === 'meat' ? 'selected' : ''}>Meat & Poultry</option>
+                                        <option value="beverages" ${product.category === 'beverages' ? 'selected' : ''}>Beverages</option>
+                                    </select>
+                                </div>
+
+                                <div>
+                                    <label for="edit-product-emoji" class="block text-sm font-medium text-gray-700 mb-2">Emoji</label>
+                                    <input type="text" id="edit-product-emoji" required maxlength="2" value="${product.emoji}" class="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-primary-500 focus:border-transparent" />
+                                </div>
+
+                                <div>
+                                    <label for="edit-product-price" class="block text-sm font-medium text-gray-700 mb-2">Price ($)</label>
+                                    <input type="number" id="edit-product-price" required step="0.01" min="0" value="${product.price}" class="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-primary-500 focus:border-transparent" />
+                                </div>
+
+                                <div>
+                                    <label for="edit-product-compare-price" class="block text-sm font-medium text-gray-700 mb-2">Compare Price ($)</label>
+                                    <input type="number" id="edit-product-compare-price" step="0.01" min="0" value="${product.comparePrice || ''}" class="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-primary-500 focus:border-transparent" />
+                                </div>
+
+                                <div>
+                                    <label for="edit-product-unit" class="block text-sm font-medium text-gray-700 mb-2">Unit</label>
+                                    <input type="text" id="edit-product-unit" required value="${product.unit}" class="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-primary-500 focus:border-transparent" />
+                                </div>
+
+                                <div>
+                                    <label for="edit-product-stock" class="block text-sm font-medium text-gray-700 mb-2">Stock Quantity</label>
+                                    <input type="number" id="edit-product-stock" required min="0" value="${product.stock}" class="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-primary-500 focus:border-transparent" />
+                                </div>
+
+                                <div class="col-span-2">
+                                    <label class="flex items-center space-x-2 cursor-pointer">
+                                        <input type="checkbox" id="edit-product-featured" ${product.featured ? 'checked' : ''} class="w-5 h-5 text-primary-600 border-gray-300 rounded focus:ring-primary-500" />
+                                        <span class="text-sm font-medium text-gray-700">Mark as Featured Product</span>
+                                    </label>
+                                </div>
+                            </div>
+
+                            <div class="flex space-x-4 mt-8">
+                                <button type="submit" id="edit-product-btn" class="flex-1 bg-primary-600 text-white py-3 rounded-lg font-semibold hover:bg-primary-700 transition">
+                                    Save Changes
+                                </button>
+                                <button type="button" onclick="closeEditProductModal()" class="flex-1 bg-gray-200 text-gray-700 py-3 rounded-lg font-semibold hover:bg-gray-300 transition">
+                                    Cancel
+                                </button>
+                            </div>
+                        </form>
+                    </div>
+                </div>
+            `;
+
+            document.body.appendChild(modal);
+            modal.addEventListener('click', function (e) {
+                if (e.target === modal) closeEditProductModal();
+            });
+        }
+
+        function closeEditProductModal() {
+            const modal = document.getElementById('edit-product-modal');
+            if (modal) modal.remove();
+        }
+
+        async function handleEditProduct(event, productId) {
+            event.preventDefault();
+
+            const btn = document.getElementById('edit-product-btn');
+            btn.disabled = true;
+            btn.textContent = 'Saving...';
+
+            const productData = {
+                name: document.getElementById('edit-product-name').value,
+                category: document.getElementById('edit-product-category').value,
+                emoji: document.getElementById('edit-product-emoji').value,
+                price: parseFloat(document.getElementById('edit-product-price').value),
+                comparePrice: document.getElementById('edit-product-compare-price').value ? parseFloat(document.getElementById('edit-product-compare-price').value) : null,
+                unit: document.getElementById('edit-product-unit').value,
+                stock: parseInt(document.getElementById('edit-product-stock').value),
+                featured: document.getElementById('edit-product-featured').checked
+            };
+
+            const result = await updateProduct(productId, productData);
+
+            if (result.success) {
+                closeEditProductModal();
+                showToast(`${productData.name} updated successfully! ✅`);
+                await loadAdminDashboard();
+                switchAdminTab('products');
+            } else {
+                showToast(result.error || 'Failed to update product');
+                btn.disabled = false;
+                btn.textContent = 'Save Changes';
+            }
+        }
+
+        // ==================== CART FUNCTIONS ====================
+
+        function addToCart(productId) {
+            const product = products.find(p => p._id === productId);
+            if (!product) return;
+
+            const existingItem = cart.find(item => item._id === productId);
+            if (existingItem) {
+                existingItem.quantity++;
+            } else {
+                cart.push({ ...product, quantity: 1 });
+            }
+
+            updateCart();
+            showToast(`${product.name} added to cart!`);
+        }
+
+        function updateCart() {
+            const cartCount = document.getElementById('cart-count');
+            const cartItems = document.getElementById('cart-items');
+            const cartFooter = document.getElementById('cart-footer');
+            const cartSubtotal = document.getElementById('cart-subtotal');
+            const cartTotal = document.getElementById('cart-total');
+
+            const totalItems = cart.reduce((sum, item) => sum + item.quantity, 0);
+            const totalPrice = cart.reduce((sum, item) => sum + (item.price * item.quantity), 0);
+
+            if (totalItems > 0) {
+                cartCount.textContent = totalItems;
+                cartCount.classList.remove('hidden');
+            } else {
+                cartCount.classList.add('hidden');
+            }
+
+            if (cart.length === 0) {
+                cartItems.innerHTML = `
+                    <div class="text-center text-gray-500 py-12">
+                        <div class="text-6xl mb-4">🛒</div>
+                        <p>Your cart is empty</p>
+                    </div>
+                `;
+                cartFooter.classList.add('hidden');
+            } else {
+                cartItems.innerHTML = cart.map(item => `
+                    <div class="flex items-center space-x-4 mb-4 pb-4 border-b">
+                        <div class="w-20 h-20 bg-gray-100 rounded-lg flex items-center justify-center text-4xl">
+                            ${item.emoji}
+                        </div>
+                        <div class="flex-1">
+                            <h4 class="font-semibold text-gray-900">${item.name}</h4>
+                            <p class="text-sm text-gray-600">${item.unit}</p>
+                            <p class="font-bold text-primary-600">$${item.price.toFixed(2)}</p>
+                        </div>
+                        <div class="flex items-center space-x-2">
+                            <button onclick="updateQuantity('${item._id}', -1)" class="w-8 h-8 bg-gray-200 rounded-lg hover:bg-gray-300 flex items-center justify-center">-</button>
+                            <span class="w-8 text-center font-semibold">${item.quantity}</span>
+                            <button onclick="updateQuantity('${item._id}', 1)" class="w-8 h-8 bg-primary-600 text-white rounded-lg hover:bg-primary-700 flex items-center justify-center">+</button>
+                        </div>
+                        <button onclick="removeFromCart('${item._id}')" class="text-red-600 hover:text-red-700">
+                            <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"></path>
+                            </svg>
+                        </button>
+                    </div>
+                `).join('');
+
+                cartSubtotal.textContent = `$${totalPrice.toFixed(2)}`;
+                cartTotal.textContent = `$${totalPrice.toFixed(2)}`;
+                cartFooter.classList.remove('hidden');
+            }
+        }
+
+        function updateQuantity(productId, change) {
+            const item = cart.find(item => item._id === productId);
+            if (item) {
+                item.quantity += change;
+                if (item.quantity <= 0) {
+                    removeFromCart(productId);
+                } else {
+                    updateCart();
+                }
+            }
+        }
+
+        function removeFromCart(productId) {
+            cart = cart.filter(item => item._id !== productId);
+            updateCart();
+            showToast('Item removed from cart');
+        }
+
+        function toggleCart() {
+            const cartSidebar = document.getElementById('cart-sidebar');
+            cartSidebar.classList.toggle('hidden');
+        }
+
+        function checkout() {
+            if (cart.length === 0) {
+                showToast('Your cart is empty!');
+                return;
+            }
+
+            if (!currentUser) {
+                toggleCart();
+                showLoginModal();
+                showToast('Please login to checkout');
+                return;
+            }
+
+            showDeliveryAddressModal();
+        }
+
+        function showDeliveryAddressModal() {
+            const modal = document.createElement('div');
+            modal.id = 'delivery-modal';
+            modal.className = 'fixed inset-0 z-50 modal-backdrop flex items-center justify-center p-4';
+            modal.innerHTML = `
+                <div class="bg-white rounded-2xl shadow-2xl w-full max-w-2xl fade-in max-h-[90%] overflow-y-auto" onclick="event.stopPropagation()">
+                    <div class="p-8">
+                        <div class="flex justify-between items-center mb-6">
+                            <h2 class="text-3xl font-bold text-gray-900">Delivery Address</h2>
+                            <button onclick="closeDeliveryModal()" class="text-gray-400 hover:text-gray-600">
+                                <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path>
+                                </svg>
+                            </button>
+                        </div>
+
+                        <form id="delivery-form" onsubmit="handleDeliverySubmit(event)">
+                            <div class="space-y-4">
+                                <div>
+                                    <label for="delivery-name" class="block text-sm font-medium text-gray-700 mb-2">Full Name</label>
+                                    <input type="text" id="delivery-name" required value="${currentUser.name}" class="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-primary-500 focus:border-transparent" />
+                                </div>
+
+                                <div>
+                                    <label for="delivery-phone" class="block text-sm font-medium text-gray-700 mb-2">Phone Number</label>
+                                    <input type="tel" id="delivery-phone" required placeholder="+1 (555) 000-0000" class="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-primary-500 focus:border-transparent" />
+                                </div>
+
+                                <div>
+                                    <label for="delivery-address" class="block text-sm font-medium text-gray-700 mb-2">Street Address</label>
+                                    <input type="text" id="delivery-address" required placeholder="123 Main Street" class="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-primary-500 focus:border-transparent" />
+                                </div>
+
+                                <div class="grid grid-cols-2 gap-4">
+                                    <div>
+                                        <label for="delivery-city" class="block text-sm font-medium text-gray-700 mb-2">City</label>
+                                        <input type="text" id="delivery-city" required placeholder="New York" class="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-primary-500 focus:border-transparent" />
+                                    </div>
+                                    <div>
+                                        <label for="delivery-zip" class="block text-sm font-medium text-gray-700 mb-2">ZIP Code</label>
+                                        <input type="text" id="delivery-zip" required placeholder="10001" class="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-primary-500 focus:border-transparent" />
+                                    </div>
+                                </div>
+
+                                <div>
+                                    <label for="delivery-notes" class="block text-sm font-medium text-gray-700 mb-2">Delivery Instructions (Optional)</label>
+                                    <textarea id="delivery-notes" rows="3" placeholder="Ring doorbell, leave at door, etc." class="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-primary-500 focus:border-transparent"></textarea>
+                                </div>
+
+                                <div class="bg-primary-50 border border-primary-200 rounded-lg p-4">
+                                    <div class="flex items-start space-x-3">
+                                        <div class="text-2xl">📍</div>
+                                        <div class="flex-1">
+                                            <h4 class="font-semibold text-gray-900 mb-2">Use My Current Location</h4>
+                                            <button type="button" onclick="getCurrentLocation()" class="text-sm bg-primary-600 text-white px-4 py-2 rounded-lg hover:bg-primary-700 transition">
+                                                Get Live Location
+                                            </button>
+                                            <div id="location-status" class="mt-2 text-sm text-gray-600"></div>
+                                        </div>
+                                    </div>
+                                </div>
+
+                                <div id="map-preview" class="hidden bg-gray-100 rounded-lg overflow-hidden">
+                                    <div class="h-64 relative">
+                                        <iframe id="location-map" class="w-full h-full border-0" loading="lazy" allowfullscreen></iframe>
+                                    </div>
+                                    <div class="p-4 bg-white">
+                                        <p class="text-sm font-medium text-gray-900">📍 <span id="location-coords"></span></p>
+                                    </div>
+                                </div>
+
+                                <div class="mt-6">
+                                    <h3 class="font-semibold text-gray-900 mb-2">Payment Method</h3>
+                                    <div class="flex space-x-4 mb-4">
+                                        <label class="flex items-center p-3 border rounded-lg cursor-pointer">
+                                            <input type="radio" name="payment-method" value="paypal" checked class="w-4 h-4" />
+                                            <span class="ml-3">Pay with PayPal</span>
+                                        </label>
+                                        <label class="flex items-center p-3 border rounded-lg cursor-pointer">
+                                            <input type="radio" name="payment-method" value="cod" class="w-4 h-4" />
+                                            <span class="ml-3">Cash on Delivery</span>
+                                        </label>
+                                    </div>
+
+                                    <div id="paypal-button-area" class="mb-4">
+                                        <div id="paypal-button-container"></div>
+                                    </div>
+
+                                    <button id="cod-direct-btn" type="button" class="w-full mb-4 bg-gray-100 text-gray-800 py-3 rounded-lg hidden">
+                                        Place Order (Cash on Delivery)
+                                    </button>
+
+                                <div class="pt-4 border-t">
+                                    <div class="flex justify-between text-sm text-gray-600 mb-2">
+                                        <span>Subtotal</span>
+                                        <span id="checkout-subtotal">$0.00</span>
+                                    </div>
+                                    <div class="flex justify-between text-sm text-gray-600 mb-2">
+                                        <span>Delivery Fee</span>
+                                        <span class="text-primary-600 font-semibold">FREE</span>
+                                    </div>
+                                    <div class="flex justify-between text-xl font-bold text-gray-900 pt-2 border-t">
+                                        <span>Total</span>
+                                        <span id="checkout-total">$0.00</span>
+                                    </div>
+                                </div>
+                            </div>
+
+                            <div class="flex space-x-4 mt-8">
+                                <button type="submit" id="place-order-btn" class="flex-1 bg-primary-600 text-white py-4 rounded-lg font-semibold hover:bg-primary-700 transition">
+                                    Place Order
+                                </button>
+                                <button type="button" onclick="closeDeliveryModal()" class="flex-1 bg-gray-200 text-gray-700 py-4 rounded-lg font-semibold hover:bg-gray-300 transition">
+                                    Cancel
+                                </button>
+                            </div>
+                        </form>
+                    </div>
+                </div>
+            `;
+
+            document.body.appendChild(modal);
+
+            const total = cart.reduce((sum, item) => sum + (item.price * item.quantity), 0);
+            document.getElementById('checkout-subtotal').textContent = `$${total.toFixed(2)}`;
+            document.getElementById('checkout-total').textContent = `$${total.toFixed(2)}`;
+
+            // Payment UI: toggle PayPal button area or COD direct button based on selection
+            function updatePaymentUI() {
+                const method = (document.querySelector('input[name="payment-method"]:checked') || {}).value || 'cod';
+                const paypalArea = document.getElementById('paypal-button-area');
+                const codBtn = document.getElementById('cod-direct-btn');
+                const placeBtn = document.getElementById('place-order-btn');
+
+                if (method === 'paypal') {
+                    if (paypalArea) paypalArea.classList.remove('hidden');
+                    if (codBtn) codBtn.classList.add('hidden');
+                    if (placeBtn) placeBtn.textContent = 'Pay with PayPal';
+                } else {
+                    if (paypalArea) paypalArea.classList.add('hidden');
+                    if (codBtn) codBtn.classList.remove('hidden');
+                    if (placeBtn) placeBtn.textContent = 'Place Order';
+                }
+            }
+
+            // Attach listeners
+            document.querySelectorAll('input[name="payment-method"]').forEach(r => r.addEventListener('change', updatePaymentUI));
+
+            // Wire COD direct button to submit the delivery form (calls existing handler)
+            const codDirectBtn = document.getElementById('cod-direct-btn');
+            if (codDirectBtn) {
+                codDirectBtn.addEventListener('click', function () {
+                    // Call the same flow as submitting the delivery form
+                    try {
+                        handleDeliverySubmit({ preventDefault: function () { } });
+                    } catch (err) {
+                        console.error('COD direct submit error:', err);
+                    }
+                });
+            }
+
+            // Initial UI state
+            updatePaymentUI();
+
+            modal.addEventListener('click', function (e) {
+                if (e.target === modal) closeDeliveryModal();
+            });
+        }
+
+        function getCurrentLocation() {
+            const statusEl = document.getElementById('location-status');
+            if (statusEl) statusEl.innerHTML = '<span class="text-primary-600">🔄 Getting your location...</span>';
+
+            if (!navigator.geolocation) {
+                if (statusEl) statusEl.innerHTML = '<span class="text-red-600">❌ Geolocation not supported by your browser</span>';
+                return;
+            }
+
+            navigator.geolocation.getCurrentPosition(
+                function (position) {
+                    const lat = position.coords.latitude;
+                    const lng = position.coords.longitude;
+
+                    if (statusEl) statusEl.innerHTML = `<span class="text-green-600">✅ Location detected successfully!</span>`;
+
+                    const mapPreview = document.getElementById('map-preview');
+                    if (mapPreview) mapPreview.classList.remove('hidden');
+                    const coordsEl = document.getElementById('location-coords');
+                    if (coordsEl) coordsEl.textContent = `Lat: ${lat.toFixed(6)}, Lng: ${lng.toFixed(6)}`;
+
+                    const mapFrame = document.getElementById('location-map');
+                    if (mapFrame) {
+                        mapFrame.src = `https://www.openstreetmap.org/export/embed.html?bbox=${lng - 0.01},${lat - 0.01},${lng + 0.01},${lat + 0.01}&layer=mapnik&marker=${lat},${lng}`;
+                    }
+
+                    window.deliveryLocation = { lat, lng };
+
+                    fetch(`https://nominatim.openstreetmap.org/reverse?format=json&lat=${lat}&lon=${lng}`)
+                        .then(response => response.json())
+                        .then(data => {
+                            if (data.address) {
+                                const addr = data.address;
+                                const addressEl = document.getElementById('delivery-address');
+                                const cityEl = document.getElementById('delivery-city');
+                                const zipEl = document.getElementById('delivery-zip');
+                                if (addressEl) addressEl.value = addr.road || addr.suburb || addr.hamlet || addr.neighbourhood || '';
+                                if (cityEl) cityEl.value = addr.city || addr.town || addr.village || '';
+                                if (zipEl) zipEl.value = addr.postcode || '';
+                            }
+                        })
+                        .catch(err => console.log('Geocoding error:', err));
+                },
+                function (error) {
+                    let errorMsg = 'Unable to get location';
+                    switch (error.code) {
+                        case error.PERMISSION_DENIED:
+                            errorMsg = '❌ Location permission denied. Please allow location access.';
+                            break;
+                        case error.POSITION_UNAVAILABLE:
+                            errorMsg = '❌ Location information unavailable';
+                            break;
+                        case error.TIMEOUT:
+                            errorMsg = '❌ Location request timed out';
+                            break;
+                    }
+                    if (statusEl) statusEl.innerHTML = `<span class="text-red-600">${errorMsg}</span>`;
+                },
+                { enableHighAccuracy: true, timeout: 10000, maximumAge: 0 }
+            );
+        }
+
+        /* function showDeliveryAddressModal() {
+             const modal = document.createElement('div');
+             modal.id = 'delivery-modal';
+             modal.className = 'fixed inset-0 z-50 modal-backdrop flex items-center justify-center p-4';
+ 
+             const total = cart.reduce((sum, item) => sum + (item.price * item.quantity), 0);
+ 
+             modal.innerHTML = `
+         <div class="bg-white rounded-2xl shadow-2xl w-full max-w-2xl fade-in max-h-[90%] overflow-y-auto" onclick="event.stopPropagation()">
+             <div class="p-8">
+                 <div class="flex justify-between items-center mb-6">
+                     <h2 class="text-3xl font-bold text-gray-900">Delivery & Payment</h2>
+                     <button onclick="closeDeliveryModal()" class="text-gray-400 hover:text-gray-600">
+                         <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                             <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path>
+                         </svg>
+                     </button>
+                 </div>
+ 
+                 <form id="delivery-form" onsubmit="handleDeliverySubmit(event)">
+                     <div class="space-y-4">
+                         <!-- Delivery Address Fields -->
+                         <div class="bg-primary-50 border border-primary-200 rounded-lg p-4">
+                             <h3 class="font-bold text-gray-900 mb-4">📍 Delivery Information</h3>
+                             
+                             <div class="space-y-3">
+                                 <div>
+                                     <label for="delivery-name" class="block text-sm font-medium text-gray-700 mb-2">Full Name</label>
+                                     <input type="text" id="delivery-name" required value="${currentUser.name}" class="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-primary-500 focus:border-transparent" />
+                                 </div>
+ 
+                                 <div>
+                                     <label for="delivery-phone" class="block text-sm font-medium text-gray-700 mb-2">Phone Number</label>
+                                     <input type="tel" id="delivery-phone" required placeholder="+91 98765 43210" class="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-primary-500 focus:border-transparent" />
+                                 </div>
+ 
+                                 <div>
+                                     <label for="delivery-address" class="block text-sm font-medium text-gray-700 mb-2">Street Address</label>
+                                     <input type="text" id="delivery-address" required placeholder="123 Main Street" class="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-primary-500 focus:border-transparent" />
+                                 </div>
+ 
+                                 <div class="grid grid-cols-2 gap-4">
+                                     <div>
+                                         <label for="delivery-city" class="block text-sm font-medium text-gray-700 mb-2">City</label>
+                                         <input type="text" id="delivery-city" required placeholder="Mumbai" class="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-primary-500 focus:border-transparent" />
+                                     </div>
+                                     <div>
+                                         <label for="delivery-zip" class="block text-sm font-medium text-gray-700 mb-2">PIN Code</label>
+                                         <input type="text" id="delivery-zip" required placeholder="400001" class="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-primary-500 focus:border-transparent" />
+                                     </div>
+                                 </div>
+ 
+                                 <div>
+                                     <label for="delivery-notes" class="block text-sm font-medium text-gray-700 mb-2">Delivery Instructions (Optional)</label>
+                                     <textarea id="delivery-notes" rows="2" placeholder="Ring doorbell, leave at door, etc." class="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-primary-500 focus:border-transparent"></textarea>
+                                 </div>
+                             </div>
+                         </div>
+ 
+                         <!-- Payment Method Selection -->
+                         <div class="bg-blue-50 border border-blue-200 rounded-lg p-4">
+                             <h3 class="font-bold text-gray-900 mb-4">💳 Payment Method</h3>
+                             
+                             <div class="space-y-3">
+                                 <label class="flex items-center p-4 border-2 border-gray-300 rounded-lg cursor-pointer hover:border-primary-500 transition">
+                                     <input type="radio" name="payment-method" value="razorpay" checked class="w-5 h-5 text-primary-600" />
+                                     <div class="ml-3 flex-1">
+                                         <div class="flex items-center justify-between">
+                                             <span class="font-semibold text-gray-900">Pay Online (Razorpay)</span>
+                                             <span class="text-2xl">💳</span>
+                                         </div>
+                                         <p class="text-sm text-gray-600 mt-1">UPI, Cards, NetBanking, Wallets</p>
+                                     </div>
+                                 </label>
+ 
+                                 <label class="flex items-center p-4 border-2 border-gray-300 rounded-lg cursor-pointer hover:border-primary-500 transition">
+                                     <input type="radio" name="payment-method" value="cod" class="w-5 h-5 text-primary-600" />
+                                     <div class="ml-3 flex-1">
+                                         <div class="flex items-center justify-between">
+                                             <span class="font-semibold text-gray-900">Cash on Delivery</span>
+                                             <span class="text-2xl">💵</span>
+                                         </div>
+                                         <p class="text-sm text-gray-600 mt-1">Pay when you receive</p>
+                                     </div>
+                                 </label>
+                             </div>
+                         </div>
+ 
+                         <!-- Order Summary -->
+                         <div class="pt-4 border-t">
+                             <div class="flex justify-between text-sm text-gray-600 mb-2">
+                                 <span>Subtotal</span>
+                                 <span id="checkout-subtotal">₹${total.toFixed(2)}</span>
+                             </div>
+                             <div class="flex justify-between text-sm text-gray-600 mb-2">
+                                 <span>Delivery Fee</span>
+                                 <span class="text-primary-600 font-semibold">FREE</span>
+                             </div>
+                             <div class="flex justify-between text-xl font-bold text-gray-900 pt-2 border-t">
+                                 <span>Total</span>
+                                 <span id="checkout-total">₹${total.toFixed(2)}</span>
+                             </div>
+                         </div>
+                     </div>
+ 
+                     <div class="flex space-x-4 mt-8">
+                         <button type="submit" id="place-order-btn" class="flex-1 bg-primary-600 text-white py-4 rounded-lg font-semibold hover:bg-primary-700 transition">
+                             Proceed to Payment
+                         </button>
+                         <button type="button" onclick="closeDeliveryModal()" class="flex-1 bg-gray-200 text-gray-700 py-4 rounded-lg font-semibold hover:bg-gray-300 transition">
+                             Cancel
+                         </button>
+                     </div>
+                 </form>
+             </div>
+         </div>
+     `;
+ 
+             document.body.appendChild(modal);
+ 
+             modal.addEventListener('click', function (e) {
+                 if (e.target === modal) closeDeliveryModal();
+             });
+         }
+         function closeDeliveryModal() {
+             const modal = document.getElementById('delivery-modal');
+             if (modal) modal.remove();
+         }
+ 
+         function getCurrentLocation() {
+             const statusEl = document.getElementById('location-status');
+             statusEl.innerHTML = '<span class="text-primary-600">🔄 Getting your location...</span>';
+ 
+             if (!navigator.geolocation) {
+                 statusEl.innerHTML = '<span class="text-red-600">❌ Geolocation not supported by your browser</span>';
+                 return;
+             }
+ 
+             navigator.geolocation.getCurrentPosition(
+                 function (position) {
+                     const lat = position.coords.latitude;
+                     const lng = position.coords.longitude;
+ 
+                     statusEl.innerHTML = `<span class="text-green-600">✅ Location detected successfully!</span>`;
+ 
+                     document.getElementById('map-preview').classList.remove('hidden');
+                     document.getElementById('location-coords').textContent = `Lat: ${lat.toFixed(6)}, Lng: ${lng.toFixed(6)}`;
+ 
+                     const mapFrame = document.getElementById('location-map');
+                     mapFrame.src = `https://www.openstreetmap.org/export/embed.html?bbox=${lng - 0.01},${lat - 0.01},${lng + 0.01},${lat + 0.01}&layer=mapnik&marker=${lat},${lng}`;
+ 
+                     window.deliveryLocation = { lat, lng };
+ 
+                     fetch(`https://nominatim.openstreetmap.org/reverse?format=json&lat=${lat}&lon=${lng}`)
+                         .then(response => response.json())
+                         .then(data => {
+                             if (data.address) {
+                                 const addr = data.address;
+                                 document.getElementById('delivery-address').value = addr.road || addr.suburb || '';
+                                 document.getElementById('delivery-city').value = addr.city || addr.town || addr.village || '';
+                                 document.getElementById('delivery-zip').value = addr.postcode || '';
+                             }
+                         })
+                         .catch(err => console.log('Geocoding error:', err));
+                 },
+                 function (error) {
+                     let errorMsg = 'Unable to get location';
+                     switch (error.code) {
+                         case error.PERMISSION_DENIED:
+                             errorMsg = '❌ Location permission denied. Please allow location access.';
+                             break;
+                         case error.POSITION_UNAVAILABLE:
+                             errorMsg = '❌ Location information unavailable';
+                             break;
+                         case error.TIMEOUT:
+                             errorMsg = '❌ Location request timed out';
+                             break;
+                     }
+                     statusEl.innerHTML = `<span class="text-red-600">${errorMsg}</span>`;
+                 },
+                 { enableHighAccuracy: true, timeout: 10000, maximumAge: 0 }
+             );
+         }
+ */
+        async function handleDeliverySubmit(event) {
+            event.preventDefault();
+            const btn = document.getElementById('place-order-btn');
+            const originalText = btn ? btn.textContent : 'Place Order';
+            try {
+                if (btn) {
+                    btn.disabled = true;
+                    btn.textContent = 'Placing Order...';
+                }
+
+                const deliveryInfo = {
+                    deliveryName: document.getElementById('delivery-name').value,
+                    deliveryPhone: document.getElementById('delivery-phone').value,
+                    deliveryAddress: document.getElementById('delivery-address').value,
+                    deliveryCity: document.getElementById('delivery-city').value,
+                    deliveryZip: document.getElementById('delivery-zip').value,
+                    deliveryNotes: document.getElementById('delivery-notes').value,
+                    deliveryLat: window.deliveryLocation ? window.deliveryLocation.lat : null,
+                    deliveryLng: window.deliveryLocation ? window.deliveryLocation.lng : null
+                };
+
+                if (!cart || cart.length === 0) {
+                    showToast('Your cart is empty. Add items before placing an order.');
+                    if (btn) {
+                        btn.disabled = false;
+                        btn.textContent = originalText || 'Place Order';
+                    }
+                    return;
+                }
+
+                const orderData = {
+                    items: cart.map(item => ({
+                        product: item._id,
+                        name: item.name,
+                        price: item.price,
+                        quantity: item.quantity
+                    })),
+                    total: cart.reduce((sum, item) => sum + (item.price * item.quantity), 0),
+                    ...deliveryInfo
+                };
+
+                const paymentMethod = (document.querySelector('input[name="payment-method"]:checked') || {}).value || 'cod';
+
+                // If user chose PayPal, render the PayPal buttons and wait for capture
+                if (paymentMethod === 'paypal') {
+                    // Prevent duplicate rendering
+                    const container = document.getElementById('paypal-button-container');
+                    if (container.innerHTML.trim() === '') {
+                        renderPayPalButtons(orderData, btn, originalText);
+                    }
+                    return; // Wait for PayPal flow to complete
+                }
+
+                // For Cash on Delivery, create order immediately
+                orderData.paymentMethod = 'cod';
+                const result = await createOrder(orderData);
+
+                if (result && result.success) {
+                    if (btn) btn.textContent = 'Order Placed ✓';
+                    showToast('Order placed successfully! 🎉 Track your delivery now!');
+                    cart = [];
+                    updateCart();
+                    if (typeof closeDeliveryModal === 'function') closeDeliveryModal();
+                    if (typeof toggleCart === 'function') toggleCart();
+
+                    setTimeout(() => {
+                        navigateTo('track');
+                    }, 1500);
+                } else {
+                    console.error('createOrder failed:', result);
+                    showToast(result && result.error ? result.error : 'Failed to place order');
+                    if (btn) {
+                        btn.disabled = false;
+                        btn.textContent = originalText || 'Place Order';
+                    }
+                }
+            } catch (err) {
+                console.error('handleDeliverySubmit error:', err);
+                showToast('An unexpected error occurred. Check console.');
+                if (btn) {
+                    btn.disabled = false;
+                    btn.textContent = originalText || 'Place Order';
+                }
+            }
+        }
+
+
+        /* async function handleDeliverySubmit(event) {
+             event.preventDefault();
+ 
+             const btn = document.getElementById('place-order-btn');
+             btn.disabled = true;
+             btn.textContent = 'Processing...';
+ 
+             const paymentMethod = document.querySelector('input[name="payment-method"]:checked').value;
+             const total = cart.reduce((sum, item) => sum + (item.price * item.quantity), 0);
+ 
+             const deliveryInfo = {
+                 deliveryName: document.getElementById('delivery-name').value,
+                 deliveryPhone: document.getElementById('delivery-phone').value,
+                 deliveryAddress: document.getElementById('delivery-address').value,
+                 deliveryCity: document.getElementById('delivery-city').value,
+                 deliveryZip: document.getElementById('delivery-zip').value,
+                 deliveryNotes: document.getElementById('delivery-notes').value,
+             };
+ 
+             if (paymentMethod === 'razorpay') {
+                 // Create Razorpay order
+                 const razorpayOrderResult = await apiRequest('/orders/create-razorpay-order', {
+                     method: 'POST',
+                     body: JSON.stringify({ amount: total })
+                 });
+ 
+                 if (!razorpayOrderResult.success) {
+                     showToast('Failed to initialize payment');
+                     btn.disabled = false;
+                     btn.textContent = 'Proceed to Payment';
+                     return;
+                 }
+ 
+                 const razorpayOrder = razorpayOrderResult.data;
+ 
+                 // Razorpay payment options
+                 const options = {
+                     key: RAZORPAY_KEY_ID,
+                     amount: razorpayOrder.amount,
+                     currency: razorpayOrder.currency,
+                     name: 'FreshMart',
+                     description: 'Grocery Order Payment',
+                     order_id: razorpayOrder.id,
+                     handler: async function (response) {
+                         // Verify payment
+                         const verifyResult = await apiRequest('/orders/verify-payment', {
+                             method: 'POST',
+                             body: JSON.stringify({
+                                 razorpay_order_id: response.razorpay_order_id,
+                                 razorpay_payment_id: response.razorpay_payment_id,
+                                 razorpay_signature: response.razorpay_signature
+                             })
+                         });
+ 
+                         if (verifyResult.success && verifyResult.data.success) {
+                             // Create order after successful payment
+                             await createOrderAfterPayment(deliveryInfo, paymentMethod, razorpayOrder.id, response.razorpay_payment_id);
+                         } else {
+                             showToast('Payment verification failed');
+                             btn.disabled = false;
+                             btn.textContent = 'Proceed to Payment';
+                         }
+                     },
+                     prefill: {
+                         name: currentUser.name,
+                         email: currentUser.email,
+                         contact: deliveryInfo.deliveryPhone
+                     },
+                     theme: {
+                         color: '#16a34a'
+                     },
+                     modal: {
+                         ondismiss: function () {
+                             btn.disabled = false;
+                             btn.textContent = 'Proceed to Payment';
+                         }
+                     }
+                 };
+ 
+                 const rzp = new Razorpay(options);
+                 rzp.open();
+ 
+             } else if (paymentMethod === 'cod') {
+                 // Create order with COD
+                 await createOrderAfterPayment(deliveryInfo, paymentMethod, null, null);
+             }
+         }
+ */
+        // ==================== TRACKING FUNCTIONS ====================
+
+        function viewOrderTracking(orderNumber) {
+            navigateTo('track');
+        }
+
+        function contactDriver(orderNumber) {
+            showToast('📞 Calling driver... (Demo: +1 555-DRIVER)');
+        }
+
+        // ==================== FILTER FUNCTIONS ====================
+
+        function filterProducts(category) {
+            document.querySelectorAll('[id^="filter-"]').forEach(btn => {
+                btn.classList.remove('bg-primary-600', 'text-white');
+                btn.classList.add('bg-white', 'text-gray-700');
+            });
+            document.getElementById(`filter-${category}`).classList.remove('bg-white', 'text-gray-700');
+            document.getElementById(`filter-${category}`).classList.add('bg-primary-600', 'text-white');
+
+            const cards = document.querySelectorAll('.product-card');
+            cards.forEach(card => {
+                if (category === 'all' || card.dataset.category === category) {
+                    card.style.display = 'block';
+                } else {
+                    card.style.display = 'none';
+                }
+            });
+        }
+
+        // ==================== MODAL FUNCTIONS ====================
+
+        function showLoginModal() {
+            hideRegisterModal();
+            document.getElementById('login-modal').classList.remove('hidden');
+        }
+
+        function hideLoginModal() {
+            document.getElementById('login-modal').classList.add('hidden');
+            document.getElementById('login-form').reset();
+        }
+
+        function showRegisterModal() {
+            hideLoginModal();
+            document.getElementById('register-modal').classList.remove('hidden');
+        }
+
+        function hideRegisterModal() {
+            document.getElementById('register-modal').classList.add('hidden');
+            document.getElementById('register-form').reset();
+        }
+
+        // ==================== UTILITY FUNCTIONS ====================
+
+        function handleNewsletter(event) {
+            event.preventDefault();
+            const email = event.target.querySelector('input').value;
+            showToast(`Thanks for subscribing with ${email}!`);
+            event.target.reset();
+        }
+
+        function showToast(message) {
+            const toast = document.getElementById('toast');
+            const toastMessage = document.getElementById('toast-message');
+            toastMessage.textContent = message;
+            toast.classList.remove('hidden');
+            setTimeout(() => {
+                toast.classList.add('hidden');
+            }, 3000);
+        }
+
+        // ==================== DELIVERY DASHBOARD (Client) ====================
+
+        async function fetchAssignedOrders() {
+            const result = await apiRequest('/orders/delivery/assigned');
+            if (result.success) return result.data;
+            showToast(result.error || 'Failed to load assigned orders');
+            return [];
+        }
+
+        async function loadDeliveryDashboard() {
+            const orders = await fetchAssignedOrders();
+
+            document.getElementById('app-content').innerHTML = `
+                <section class="py-12 bg-gray-50 min-h-screen">
+                    <div class="max-w-6xl mx-auto px-4 sm:px-6 lg:px-8">
+                        <div class="flex items-center justify-between mb-8">
+                            <div>
+                                <h1 class="text-3xl font-bold text-gray-900">Delivery Dashboard</h1>
+                                <p class="text-sm text-gray-600">Welcome, ${currentUser ? currentUser.name : ''} — manage your assigned orders here.</p>
+                            </div>
+                            <div>
+                                <button onclick="navigateTo('home')" class="px-4 py-2 bg-white border rounded-lg">Back to Store</button>
+                            </div>
+                        </div>
+
+                        <div class="space-y-4">
+                            ${orders.length === 0 ? `
+                                <div class="bg-white rounded-xl shadow p-8 text-center">No orders assigned yet.</div>
+                            ` : orders.map(o => `
+                                <div class="bg-white rounded-xl shadow p-6">
+                                    <div class="flex justify-between items-start mb-4">
+                                        <div>
+                                            <h3 class="font-bold text-lg text-gray-900">Order #${o.orderNumber}</h3>
+                                            <p class="text-sm text-gray-600">Customer: ${o.user ? o.user.name : 'Unknown'}</p>
+                                            <p class="text-sm text-gray-600">Placed: ${new Date(o.createdAt).toLocaleString()}</p>
+                                            ${o.estimatedDelivery ? `<p class="text-sm text-primary-600 mt-1">⏱️ Estimated: ${new Date(o.estimatedDelivery).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</p>` : ''}
+                                        </div>
+                                        <div class="text-right">
+                                            <div class="inline-block px-3 py-1 rounded-full text-sm font-semibold ${o.status === 'delivered' ? 'bg-green-100 text-green-800' : o.status === 'out_for_delivery' ? 'bg-primary-100 text-primary-800' : 'bg-yellow-100 text-yellow-800'}">
+                                                ${o.status.toUpperCase()}
+                                            </div>
+                                            <p class="text-xl font-bold text-gray-900 mt-2">$${(o.total || 0).toFixed(2)}</p>
+                                        </div>
+                                    </div>
+
+                                    ${o.deliveryAddress ? `
+                                        <div class="bg-gray-50 rounded-lg p-4 mb-4">
+                                            <h4 class="font-semibold text-gray-900 mb-2">📍 Delivery Address</h4>
+                                            <p class="text-sm text-gray-700">${o.deliveryName}</p>
+                                            <p class="text-sm text-gray-700">${o.deliveryPhone}</p>
+                                            <p class="text-sm text-gray-700">${o.deliveryAddress}, ${o.deliveryCity} ${o.deliveryZip}</p>
+                                            ${o.deliveryNotes ? `<p class="text-sm text-gray-600 mt-2 italic">"${o.deliveryNotes}"</p>` : ''}
+                                        </div>
+                                    ` : ''}
+
+                                    <div class="border-t pt-4">
+                                        <h4 class="font-semibold text-gray-900 mb-3">Items:</h4>
+                                        <div class="space-y-2 mb-4">
+                                            ${o.items.map(item => `
+                                                <div class="flex justify-between text-sm">
+                                                    <span class="text-gray-700">${item.name} x ${item.quantity}</span>
+                                                    <span class="font-semibold text-gray-900">$${(item.price * item.quantity).toFixed(2)}</span>
+                                                </div>
+                                            `).join('')}
+                                        </div>
+
+                                        <div class="flex items-center justify-between">
+                                            <div class="flex items-center space-x-2">
+                                                <label class="text-sm font-medium text-gray-700">Update Status:</label>
+                                                <select onchange="deliveryUpdateStatus('${o._id}', this.value)" class="px-3 py-1 rounded-lg border text-sm">
+                                                    <option value="pending" ${o.status === 'pending' ? 'selected' : ''}>Pending</option>
+                                                    <option value="processing" ${o.status === 'processing' ? 'selected' : ''}>Processing</option>
+                                                    <option value="out_for_delivery" ${o.status === 'out_for_delivery' ? 'selected' : ''}>Out for Delivery</option>
+                                                </select>
+                                            </div>
+
+                                            <div class="flex space-x-2">
+                                                ${o.status !== 'delivered' ? `<button onclick="deliveryGenerateOtp('${o._id}')" class="px-3 py-2 bg-secondary-500 text-white rounded-lg">Generate OTP</button>` : ''}
+                                                ${o.status !== 'delivered' ? `<button onclick="deliveryVerifyOtp('${o._id}')" class="px-3 py-2 bg-green-600 text-white rounded-lg">Verify OTP</button>` : ''}
+                                            </div>
+                                        </div>
+                                    </div>
+                                </div>
+                            `).join('')}
+                        </div>
+                    </div>
+                </section>
+            `;
+        }
+
+        async function deliveryGenerateOtp(orderId) {
+            if (!confirm('Generate OTP and send to customer?')) return;
+            const res = await apiRequest(`/orders/delivery/${orderId}/generate-otp`, { method: 'POST' });
+            if (res.success) {
+                showToast(res.data.message || 'OTP generated');
+                if (res.data.otpSent) showToast('OTP sent via SMS');
+                loadDeliveryDashboard();
+            } else {
+                showToast(res.error || 'Failed to generate OTP');
+            }
+        }
+
+        async function deliveryVerifyOtp(orderId) {
+            const otp = prompt('Enter OTP provided by customer:');
+            if (!otp) return showToast('OTP entry cancelled');
+            const res = await apiRequest(`/orders/delivery/${orderId}/verify-otp`, { method: 'POST', body: JSON.stringify({ otp }) });
+            if (res.success) {
+                showToast(res.data.message || 'Order marked delivered');
+                loadDeliveryDashboard();
+            } else {
+                showToast(res.error || res.data && res.data.message || 'OTP verification failed');
+            }
+        }
+
+        async function deliveryUpdateStatus(orderId, status) {
+            const res = await apiRequest(`/orders/delivery/${orderId}/status`, { method: 'PUT', body: JSON.stringify({ status }) });
+            if (res.success) {
+                showToast('Status updated');
+                loadDeliveryDashboard();
+            } else {
+                showToast(res.error || 'Failed to update status');
+            }
+        }
+
+        // ==================== INITIALIZATION ====================
+
+        document.addEventListener('DOMContentLoaded', async function () {
+            try {
+                // Check authentication
+                checkAuth();
+
+                // Fetch initial data
+                await fetchProducts();
+
+                // Hide loading overlay
+                document.getElementById('loading-overlay').classList.add('hidden');
+
+                // Navigate to home
+                await navigateTo('home');
+
+                // Close dropdowns when clicking outside
+                document.addEventListener('click', function (event) {
+                    if (!event.target.closest('#user-menu')) {
+                        document.getElementById('user-dropdown').classList.add('hidden');
+                    }
+                });
+
+                // Modal click handlers
+                document.getElementById('login-modal').addEventListener('click', function (e) {
+                    if (e.target === this) hideLoginModal();
+                });
+                document.getElementById('register-modal').addEventListener('click', function (e) {
+                    if (e.target === this) hideRegisterModal();
+                });
+            } catch (error) {
+                console.erroR('Initialization error:', error);
+                document.getElementById('loading-overlay').classList.add('hidden');
+                showToast('Error loading application. Please refresh the page.');
+            }
+        });
+    </script>
+    <script>(function () { function c() { var b = a.contentDocument || a.contentWindow.document; if (b) { var d = b.createElement('script'); d.innerHTML = "window.__CF$cv$params={r:'9a70cbc274962e2e',t:'MTc2NDU3MzM1My4wMDAwMDA='};var a=document.createElement('script');a.nonce='';a.src='/cdn-cgi/challenge-platform/scripts/jsd/main.js';document.getElementsByTagName('head')[0].appendChild(a);"; b.getElementsByTagName('head')[0].appendChild(d) } } if (document.body) { var a = document.createElement('iframe'); a.height = 1; a.width = 1; a.style.position = 'absolute'; a.style.top = 0; a.style.left = 0; a.style.border = 'none'; a.style.visibility = 'hidden'; document.body.appendChild(a); if ('loading' !== document.readyState) c(); else if (window.addEventListener) document.addEventListener('DOMContentLoaded', c); else { var e = document.onreadystatechange || function () { }; document.onreadystatechange = function (b) { e(b); 'loading' !== document.readyState && (document.onreadystatechange = e, c()) } } } })();</script>
+</body>
+
+</html>
